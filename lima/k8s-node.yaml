@@ -1,0 +1,75 @@
+minimumLimaVersion: "1.0.0"
+vmType: vz
+arch: aarch64
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+# Defaults, overridden per node at create time
+cpus: 2
+memory: 3GiB
+disk: 30GiB
+
+mounts: []                      # no host mounts, VMs stay self-contained
+containerd: { system: false, user: false }   # we install our own
+
+networks:
+  - vzNAT: true                 # shows up in the guest as lima0
+
+ssh:
+  forwardAgent: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      K8S_MINOR="v1.34"         # change to the minor you want to deploy
+
+      # Hostname = Lima instance name (cp1, w1, ...)
+      hostnamectl set-hostname "${LIMA_CIDATA_NAME}"
+
+      # Idempotency guard: skip if already provisioned
+      [ -f /etc/k8s-node-ready ] && exit 0
+
+      # Swap off
+      swapoff -a
+      sed -i '/ swap / s/^/#/' /etc/fstab
+
+      # Kernel modules and sysctls
+      cat >/etc/modules-load.d/k8s.conf <<EOF
+      overlay
+      br_netfilter
+      EOF
+      modprobe overlay
+      modprobe br_netfilter
+      cat >/etc/sysctl.d/99-k8s.conf <<EOF
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+      EOF
+      sysctl --system
+
+      # containerd with the systemd cgroup driver
+      apt-get update
+      apt-get install -y containerd apt-transport-https ca-certificates curl gpg
+      mkdir -p /etc/containerd
+      containerd config default >/etc/containerd/config.toml
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      systemctl enable --now containerd
+      systemctl restart containerd
+
+      # kubeadm / kubelet / kubectl
+      mkdir -p /etc/apt/keyrings
+      curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+        >/etc/apt/sources.list.d/kubernetes.list
+      apt-get update
+      apt-get install -y kubelet kubeadm kubectl
+      apt-mark hold kubelet kubeadm kubectl
+      systemctl enable kubelet
+
+      touch /etc/k8s-node-ready
