@@ -1,0 +1,150 @@
+
+########## 1. Baseline: nodes, etcd members, VIP holder
+
+$ [cp1] kubectl get nodes -o wide
+NAME   STATUS   ROLES           AGE   VERSION    INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+cp1    Ready    control-plane   41m   v1.34.12   192.168.105.3   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp2    Ready    control-plane   39m   v1.34.12   192.168.105.6   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp3    Ready    control-plane   38m   v1.34.12   192.168.105.5   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w1     Ready    <none>          38m   v1.34.12   192.168.105.2   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w2     Ready    <none>          38m   v1.34.12   192.168.105.4   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key endpoint health --cluster -w table
++----------------------------+--------+------------+-------+
+|          ENDPOINT          | HEALTH |    TOOK    | ERROR |
++----------------------------+--------+------------+-------+
+| https://192.168.105.3:2379 |   true | 6.142981ms |       |
+| https://192.168.105.6:2379 |   true | 7.937441ms |       |
+| https://192.168.105.5:2379 |   true | 9.801057ms |       |
++----------------------------+--------+------------+-------+
+VIP 192.168.105.200 is held by: cp3  (worst case: we kill it). kubectl will be run from: cp1
+
+########## 2. Crash cp3 (force-stop = power loss) and poll the API through the VIP every second
+stopped at 10:34:04
+time="2026-10-26T10:34:04+01:00" level=info msg="Sending SIGKILL to the vz driver process 94791"
+time="2026-10-26T10:34:04+01:00" level=info msg="Sending SIGKILL to the host agent process 94791"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing *.pid *.sock *.tmp under `/Users/johnsmith/.lima/cp3`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/boot-session.tmp`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/default_ep.sock`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/default_fd.sock`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/ha.pid`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/ha.sock`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/ssh.sock`"
+time="2026-10-26T10:34:04+01:00" level=info msg="Removing `/Users/johnsmith/.lima/cp3/vz.pid`"
+10:34:05 t+01s healthz=no-answer
+10:34:07 t+02s healthz=no-answer
+10:34:09 t+03s healthz=no-answer
+10:34:10 t+04s healthz=ok
+10:34:11 t+05s healthz=ok
+10:34:12 t+06s healthz=ok
+10:34:13 t+07s healthz=ok
+10:34:14 t+08s healthz=ok
+10:34:15 t+09s healthz=ok
+10:34:16 t+10s healthz=ok
+10:34:17 t+11s healthz=ok
+10:34:19 t+12s healthz=ok
+10:34:20 t+13s healthz=ok
+10:34:21 t+14s healthz=ok
+10:34:22 t+15s healthz=ok
+10:34:23 t+16s healthz=ok
+10:34:24 t+17s healthz=ok
+10:34:25 t+18s healthz=ok
+10:34:26 t+19s healthz=ok
+10:34:27 t+20s healthz=ok
+Seconds without an answer on the VIP during failover: 3
+VIP holder now: cp2
+
+########## 3. The API works with only 2 of 3 control planes: read, write, delete
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   41m   v1.34.12
+cp2    Ready    control-plane   40m   v1.34.12
+cp3    Ready    control-plane   39m   v1.34.12
+w1     Ready    <none>          38m   v1.34.12
+w2     Ready    <none>          38m   v1.34.12
+
+$ [cp1] kubectl create namespace ha-test
+namespace/ha-test created
+
+$ [cp1] kubectl create configmap written-during-outage -n ha-test --from-literal=proof=quorum-2-of-3
+configmap/written-during-outage created
+
+$ [cp1] kubectl create deployment web -n ha-test --image=nginx --replicas=2
+deployment.apps/web created
+
+$ [cp1] kubectl get cm,deploy -n ha-test
+NAME                              DATA   AGE
+configmap/kube-root-ca.crt        1      0s
+configmap/written-during-outage   1      0s
+
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   0/2     2            0           0s
+
+$ [cp1] kubectl get --raw=/readyz?verbose | tail -4
+[+]poststarthook/apiservice-openapi-controller ok
+[+]poststarthook/apiservice-openapiv3-controller ok
+[+]shutdown ok
+readyz check passed
+
+########## 4. etcd: 2 of 3 members healthy = quorum
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key endpoint health --cluster -w table
++----------------------------+--------+--------------+---------------------------+
+|          ENDPOINT          | HEALTH |     TOOK     |           ERROR           |
++----------------------------+--------+--------------+---------------------------+
+| https://192.168.105.3:2379 |   true |   4.028464ms |                           |
+| https://192.168.105.6:2379 |   true |   5.249674ms |                           |
+| https://192.168.105.5:2379 |  false | 5.004544302s | context deadline exceeded |
++----------------------------+--------+--------------+---------------------------+
+{"level":"warn","ts":"2026-10-26T09:34:32.822105Z","logger":"client","caller":"v3@v3.6.5/retry_interceptor.go:65","msg":"retrying of unary invoker failed","target":"etcd-endpoints://0x4000300780/192.168.105.5:2379","method":"/etcdserverpb.KV/Range","attempt":0,"error":"rpc error: code = DeadlineExceeded desc = context deadline exceeded while waiting for connections to become ready"}
+Error: unhealthy cluster
+command terminated with exit code 1
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key member list -w table
++------------------+---------+------+----------------------------+----------------------------+------------+
+|        ID        | STATUS  | NAME |         PEER ADDRS         |        CLIENT ADDRS        | IS LEARNER |
++------------------+---------+------+----------------------------+----------------------------+------------+
+| 252c2b038f93e0ff | started |  cp3 | https://192.168.105.5:2380 | https://192.168.105.5:2379 |      false |
+| 3903ed6124adcb9c | started |  cp1 | https://192.168.105.3:2380 | https://192.168.105.3:2379 |      false |
+| ae5d484e220ba16c | started |  cp2 | https://192.168.105.6:2380 | https://192.168.105.6:2379 |      false |
++------------------+---------+------+----------------------------+----------------------------+------------+
+
+########## 5. After the node-monitor grace period the dead node is NotReady
+
+$ [cp1] kubectl get nodes
+NAME   STATUS     ROLES           AGE   VERSION
+cp1    Ready      control-plane   42m   v1.34.12
+cp2    Ready      control-plane   41m   v1.34.12
+cp3    NotReady   control-plane   40m   v1.34.12
+w1     Ready      <none>          39m   v1.34.12
+w2     Ready      <none>          39m   v1.34.12
+
+$ [cp1] kubectl delete namespace ha-test --wait=false
+namespace "ha-test" deleted
+
+########## 6. Bring cp3 back and confirm full health
+time="2026-10-26T10:35:31+01:00" level=info msg="[hostagent] Not forwarding UDP 127.0.0.1:5353"
+time="2026-10-26T10:35:31+01:00" level=info msg="READY. Run `limactl shell cp3` to open the shell."
+
+$ [cp1] kubectl wait --for=condition=Ready node/cp3 --timeout=300s
+node/cp3 condition met
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   43m   v1.34.12
+cp2    Ready    control-plane   41m   v1.34.12
+cp3    Ready    control-plane   40m   v1.34.12
+w1     Ready    <none>          40m   v1.34.12
+w2     Ready    <none>          40m   v1.34.12
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key endpoint health --cluster -w table
++----------------------------+--------+------------+-------+
+|          ENDPOINT          | HEALTH |    TOOK    | ERROR |
++----------------------------+--------+------------+-------+
+| https://192.168.105.3:2379 |   true | 5.116672ms |       |
+| https://192.168.105.6:2379 |   true | 5.784074ms |       |
+| https://192.168.105.5:2379 |   true | 5.938373ms |       |
++----------------------------+--------+------------+-------+
+VIP holder: cp2
+API on https://192.168.105.200:6443 healthy after ~0s

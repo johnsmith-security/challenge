@@ -15,7 +15,7 @@ mounts: []                      # no host mounts, VMs stay self-contained
 containerd: { system: false, user: false }   # we install our own
 
 networks:
-  - vzNAT: true                 # shows up in the guest as lima0
+  - lima: shared                # socket_vmnet, 192.168.105.0/24, VMs can reach each other; shows up as lima0
 
 ssh:
   forwardAgent: false

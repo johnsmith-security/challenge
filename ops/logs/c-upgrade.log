@@ -1,0 +1,652 @@
+
+########## 0. Pre-flight: versions, fresh etcd backup, where controller-manager/scheduler connect
+
+$ [cp1] kubectl get nodes -o wide
+NAME   STATUS   ROLES           AGE   VERSION    INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+cp1    Ready    control-plane   46m   v1.34.12   192.168.105.3   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp2    Ready    control-plane   45m   v1.34.12   192.168.105.6   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp3    Ready    control-plane   44m   v1.34.12   192.168.105.5   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w1     Ready    <none>          43m   v1.34.12   192.168.105.2   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w2     Ready    <none>          43m   v1.34.12   192.168.105.4   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+
+$ [cp1] kubectl version
+Client Version: v1.34.12
+Kustomize Version: v5.7.1
+Server Version: v1.34.12
+
+$ [cp1] sudo mkdir -p /var/backups && kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /var/lib/etcd/pre-upgrade.db 2>&1 | tail -2 && sudo mv /var/lib/etcd/pre-upgrade.db /var/backups/etcd-pre-upgrade-20261026-103926.db && ls -l /var/backups/etcd-pre-upgrade-20261026-103926.db
+Snapshot saved at /var/lib/etcd/pre-upgrade.db
+Server version 3.6.0
+-rw------- 1 root root 12701728 Oct 26 10:39 /var/backups/etcd-pre-upgrade-20261026-103926.db
+
+$ [cp1] sudo grep -H "server:" /etc/kubernetes/controller-manager.conf /etc/kubernetes/scheduler.conf
+/etc/kubernetes/controller-manager.conf:    server: https://192.168.105.3:6443
+/etc/kubernetes/scheduler.conf:    server: https://192.168.105.3:6443
+
+########## 1. Deploy the sample workload (2 replicas, PDB minAvailable=1, preStop sleep) and start probing it every second
+
+$ [cp1] kubectl apply -f /tmp/upgrade-demo.yaml
+namespace/upgrade-demo created
+deployment.apps/nginx-demo created
+poddisruptionbudget.policy/nginx-demo created
+service/nginx-demo created
+
+$ [cp1] kubectl -n upgrade-demo rollout status deployment/nginx-demo --timeout=180s
+Waiting for deployment "nginx-demo" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "nginx-demo" rollout to finish: 1 of 2 updated replicas are available...
+deployment "nginx-demo" successfully rolled out
+
+$ [cp1] kubectl -n upgrade-demo get deploy,pdb,svc,pods -o wide
+NAME                         READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES         SELECTOR
+deployment.apps/nginx-demo   2/2     2            2           12s   nginx        nginx:stable   app=nginx-demo
+
+NAME                                    MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+poddisruptionbudget.policy/nginx-demo   1               N/A               1                     12s
+
+NAME                 TYPE       CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE   SELECTOR
+service/nginx-demo   NodePort   10.103.153.126   <none>        80:30080/TCP   12s   app=nginx-demo
+
+NAME                              READY   STATUS    RESTARTS   AGE   IP              NODE   NOMINATED NODE   READINESS GATES
+pod/nginx-demo-65b8f48cc6-gf77c   1/1     Running   0          12s   10.244.80.202   w2     <none>           <none>
+pod/nginx-demo-65b8f48cc6-lzrwp   1/1     Running   0          12s   10.244.190.70   w1     <none>           <none>
+probe targets: http://192.168.105.2:30080/ http://192.168.105.4:30080/ https://192.168.105.200:6443/healthz
+first probe lines:
+10:39:39 http://192.168.105.4:30080/ 200
+10:39:39 http://192.168.105.2:30080/ 200
+10:39:39 https://192.168.105.200:6443/healthz 200
+10:39:40 http://192.168.105.2:30080/ 200
+10:39:40 http://192.168.105.4:30080/ 200
+10:39:40 https://192.168.105.200:6443/healthz 200
+
+########## 2. Point apt at the v1.35 repository on every node and pick the target patch version
+
+$ [cp1] sudo sed -i 's#/v1.34/#/v1.35/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update -qq 2>&1 | tail -2; grep -o 'stable:/v[0-9.]*' /etc/apt/sources.list.d/kubernetes.list
+stable:/v1.35
+
+$ [cp2] sudo sed -i 's#/v1.34/#/v1.35/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update -qq 2>&1 | tail -2; grep -o 'stable:/v[0-9.]*' /etc/apt/sources.list.d/kubernetes.list
+stable:/v1.35
+
+$ [cp3] sudo sed -i 's#/v1.34/#/v1.35/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update -qq 2>&1 | tail -2; grep -o 'stable:/v[0-9.]*' /etc/apt/sources.list.d/kubernetes.list
+stable:/v1.35
+
+$ [w1] sudo sed -i 's#/v1.34/#/v1.35/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update -qq 2>&1 | tail -2; grep -o 'stable:/v[0-9.]*' /etc/apt/sources.list.d/kubernetes.list
+stable:/v1.35
+
+$ [w2] sudo sed -i 's#/v1.34/#/v1.35/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update -qq 2>&1 | tail -2; grep -o 'stable:/v[0-9.]*' /etc/apt/sources.list.d/kubernetes.list
+stable:/v1.35
+target package: kubeadm=1.35.9-1.1  ->  Kubernetes v1.35.9
+
+$ [cp1] apt-cache madison kubeadm | head -3
+   kubeadm | 1.35.9-1.1 | https://pkgs.k8s.io/core:/stable:/v1.35/deb  Packages
+   kubeadm | 1.35.8-1.1 | https://pkgs.k8s.io/core:/stable:/v1.35/deb  Packages
+   kubeadm | 1.35.7-1.1 | https://pkgs.k8s.io/core:/stable:/v1.35/deb  Packages
+
+########## 3. Control planes, one at a time (cp1 runs 'kubeadm upgrade apply', the others 'kubeadm upgrade node')
+
+########## 3.cp1 upgrade cp1
+
+$ [cp1] sudo apt-mark unhold kubeadm >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubeadm=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubeadm >/dev/null && kubeadm version -o short
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+v1.35.9
+
+$ [cp1] sudo kubeadm upgrade plan 2>&1 | tail -40
+kubelet     cp2       v1.34.12   v1.35.9
+kubelet     cp3       v1.34.12   v1.35.9
+kubelet     w1        v1.34.12   v1.35.9
+kubelet     w2        v1.34.12   v1.35.9
+
+Upgrade to the latest stable version:
+
+COMPONENT                 NODE      CURRENT    TARGET
+kube-apiserver            cp1       v1.34.12   v1.35.9
+kube-apiserver            cp2       v1.34.12   v1.35.9
+kube-apiserver            cp3       v1.34.12   v1.35.9
+kube-controller-manager   cp1       v1.34.12   v1.35.9
+kube-controller-manager   cp2       v1.34.12   v1.35.9
+kube-controller-manager   cp3       v1.34.12   v1.35.9
+kube-scheduler            cp1       v1.34.12   v1.35.9
+kube-scheduler            cp2       v1.34.12   v1.35.9
+kube-scheduler            cp3       v1.34.12   v1.35.9
+kube-proxy                          1.34.12    v1.35.9
+CoreDNS                             v1.12.1    v1.13.1
+etcd                      cp1       3.6.5-0    3.6.6-0
+etcd                      cp2       3.6.5-0    3.6.6-0
+etcd                      cp3       3.6.5-0    3.6.6-0
+
+You can now apply the upgrade by executing the following command:
+
+	kubeadm upgrade apply v1.35.9
+
+_____________________________________________________________________
+
+
+The table below shows the current state of component configs as understood by this version of kubeadm.
+Configs that have a "yes" mark in the "MANUAL UPGRADE REQUIRED" column require manual config upgrade or
+resetting to kubeadm defaults before a successful upgrade can be performed. The version to manually
+upgrade to is denoted in the "PREFERRED VERSION" column.
+
+API GROUP                 CURRENT VERSION   PREFERRED VERSION   MANUAL UPGRADE REQUIRED
+kubeproxy.config.k8s.io   v1alpha1          v1alpha1            no
+kubelet.config.k8s.io     v1beta1           v1beta1             no
+_____________________________________________________________________
+
+
+$ [cp1] sudo kubeadm upgrade apply v1.35.9 -y 2>&1 | tail -25
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade/control-plane] The control plane instance for this node was successfully upgraded!
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[kubelet] Creating a ConfigMap "kubelet-config" in namespace kube-system with the configuration for the kubelets in the cluster
+[upgrade/kubeconfig] The kubeconfig files for this node were successfully upgraded!
+W1026 10:45:56.378723   11985 postupgrade.go:105] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-45-56 for kubelet config. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet config file to /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-45-56/config.yaml
+[patches] Applied patch of type "application/strategic-merge-patch+json" to target "kubeletconfiguration"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[upgrade/bootstrap-token] Configuring bootstrap token and cluster-info RBAC rules
+[bootstrap-token] Configured RBAC rules to allow Node Bootstrap tokens to get nodes
+[bootstrap-token] Configured RBAC rules to allow Node Bootstrap tokens to post CSRs in order for nodes to get long term certificate credentials
+[bootstrap-token] Configured RBAC rules to allow the csrapprover controller automatically approve CSRs from a Node Bootstrap Token
+[bootstrap-token] Configured RBAC rules to allow certificate rotation for all node client certificates in the cluster
+[bootstrap-token] Configured RBAC rules to allow the API server kubelet client certificate to access the kubelet API
+[upgrade/addon] Skipping upgrade of addons because control plane instances [cp2 cp3] have not been upgraded
+[upgrade/addon] Skipping upgrade of addons because control plane instances [cp2 cp3] have not been upgraded
+W1026 10:45:59.147571   11985 postupgrade.go:203] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-env2501823340 for kubelet env file. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet env file to /etc/kubernetes/tmp/kubeadm-kubelet-env2501823340/kubeadm-flags.env
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+
+[upgrade] SUCCESS! A control plane node of your cluster was upgraded to "v1.35.9".
+
+[upgrade] Now please proceed with upgrading the rest of the nodes by following the right order.
+
+$ [cp1] kubectl drain cp1 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+node/cp1 cordoned
+Warning: ignoring DaemonSet-managed Pods: calico-system/calico-node-kl6xj, calico-system/csi-node-driver-9jqbb, kube-system/kube-proxy-fk9lg
+evicting pod tigera-operator/tigera-operator-6b5584d9cb-kbg5c
+evicting pod calico-system/calico-typha-5ff7fbc949-2qpbn
+evicting pod calico-apiserver/calico-apiserver-69dd487547-sgz66
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+evicting pod calico-system/calico-kube-controllers-c847ddbcd-t6w56
+evicting pod calico-system/whisker-748f7bccb4-jl82h
+evicting pod calico-system/goldmane-744d5c978b-dkqr2
+evicting pod kube-system/coredns-66bc5c9577-jcf76
+evicting pod kube-system/coredns-66bc5c9577-q9lxh
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/tigera-operator-6b5584d9cb-kbg5c evicted
+pod/calico-kube-controllers-c847ddbcd-t6w56 evicted
+pod/goldmane-744d5c978b-dkqr2 evicted
+pod/whisker-748f7bccb4-jl82h evicted
+pod/calico-apiserver-69dd487547-sgz66 evicted
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/coredns-66bc5c9577-q9lxh evicted
+pod/coredns-66bc5c9577-jcf76 evicted
+pod/calico-typha-5ff7fbc949-2qpbn evicted
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+error when evicting pods/"calico-apiserver-69dd487547-x7w5c" -n "calico-apiserver" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod calico-apiserver/calico-apiserver-69dd487547-x7w5c
+pod/calico-apiserver-69dd487547-x7w5c evicted
+node/cp1 drained
+
+$ [cp1] sudo apt-mark unhold kubelet kubectl >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubelet=1.35.9-1.1 kubectl=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubelet kubectl >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart kubelet && kubelet --version
+
+Running kernel seems to be up-to-date.
+
+Services to be restarted:
+ systemctl restart kubelet.service
+ systemctl restart lima-guestagent.service
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Kubernetes v1.35.9
+
+$ [cp1] kubectl uncordon cp1
+node/cp1 uncordoned
+
+$ [cp1] kubectl wait --for=condition=Ready node/cp1 --timeout=300s
+node/cp1 condition met
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   54m   v1.35.9
+cp2    Ready    control-plane   52m   v1.34.12
+cp3    Ready    control-plane   51m   v1.34.12
+w1     Ready    <none>          51m   v1.34.12
+w2     Ready    <none>          51m   v1.34.12
+
+$ [cp1] kubectl -n kube-system get pods -l tier=control-plane -o custom-columns=POD:.metadata.name,IMAGE:.spec.containers[0].image --sort-by=.metadata.name
+POD                           IMAGE
+etcd-cp1                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp2                      registry.k8s.io/etcd:3.6.5-0
+etcd-cp3                      registry.k8s.io/etcd:3.6.5-0
+kube-apiserver-cp1            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp2            registry.k8s.io/kube-apiserver:v1.34.12
+kube-apiserver-cp3            registry.k8s.io/kube-apiserver:v1.34.12
+kube-controller-manager-cp1   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp2   registry.k8s.io/kube-controller-manager:v1.34.12
+kube-controller-manager-cp3   registry.k8s.io/kube-controller-manager:v1.34.12
+kube-scheduler-cp1            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp2            registry.k8s.io/kube-scheduler:v1.34.12
+kube-scheduler-cp3            registry.k8s.io/kube-scheduler:v1.34.12
+
+########## 3.cp2 upgrade cp2
+
+$ [cp2] sudo apt-mark unhold kubeadm >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubeadm=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubeadm >/dev/null && kubeadm version -o short
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+v1.35.9
+
+$ [cp2] sudo kubeadm upgrade node 2>&1 | tail -15
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=kube-scheduler
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade/control-plane] The control plane instance for this node was successfully upgraded!
+[upgrade/kubeconfig] The kubeconfig files for this node were successfully upgraded!
+W1026 10:50:51.776324   16198 postupgrade.go:105] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-50-51 for kubelet config. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet config file to /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-50-51/config.yaml
+[patches] Applied patch of type "application/strategic-merge-patch+json" to target "kubeletconfiguration"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[upgrade/addon] Skipping upgrade of addons because control plane instances [cp3] have not been upgraded
+[upgrade/addon] Skipping upgrade of addons because control plane instances [cp3] have not been upgraded
+W1026 10:50:51.798768   16198 postupgrade.go:203] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-env1621488118 for kubelet env file. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet env file to /etc/kubernetes/tmp/kubeadm-kubelet-env1621488118/kubeadm-flags.env
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+
+$ [cp1] kubectl drain cp2 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+node/cp2 cordoned
+node/cp2 drained
+Warning: ignoring DaemonSet-managed Pods: calico-system/calico-node-4q2n5, calico-system/csi-node-driver-wd82n, kube-system/kube-proxy-vb6hw
+
+$ [cp2] sudo apt-mark unhold kubelet kubectl >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubelet=1.35.9-1.1 kubectl=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubelet kubectl >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart kubelet && kubelet --version
+
+Running kernel seems to be up-to-date.
+
+Services to be restarted:
+ systemctl restart kubelet.service
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Kubernetes v1.35.9
+
+$ [cp1] kubectl uncordon cp2
+node/cp2 uncordoned
+
+$ [cp1] kubectl wait --for=condition=Ready node/cp2 --timeout=300s
+node/cp2 condition met
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   58m   v1.35.9
+cp2    Ready    control-plane   56m   v1.35.9
+cp3    Ready    control-plane   55m   v1.34.12
+w1     Ready    <none>          55m   v1.34.12
+w2     Ready    <none>          55m   v1.34.12
+
+$ [cp1] kubectl -n kube-system get pods -l tier=control-plane -o custom-columns=POD:.metadata.name,IMAGE:.spec.containers[0].image --sort-by=.metadata.name
+POD                           IMAGE
+etcd-cp1                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp2                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp3                      registry.k8s.io/etcd:3.6.5-0
+kube-apiserver-cp1            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp2            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp3            registry.k8s.io/kube-apiserver:v1.34.12
+kube-controller-manager-cp1   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp2   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp3   registry.k8s.io/kube-controller-manager:v1.34.12
+kube-scheduler-cp1            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp2            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp3            registry.k8s.io/kube-scheduler:v1.34.12
+
+########## 3.cp3 upgrade cp3
+
+$ [cp3] sudo apt-mark unhold kubeadm >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubeadm=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubeadm >/dev/null && kubeadm version -o short
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+v1.35.9
+
+$ [cp3] sudo kubeadm upgrade node 2>&1 | tail -15
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=kube-scheduler
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade/control-plane] The control plane instance for this node was successfully upgraded!
+[upgrade/kubeconfig] The kubeconfig files for this node were successfully upgraded!
+W1026 10:54:26.010625    4878 postupgrade.go:105] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-54-26 for kubelet config. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet config file to /etc/kubernetes/tmp/kubeadm-kubelet-config-2026-10-26-10-54-26/config.yaml
+[patches] Applied patch of type "application/strategic-merge-patch+json" to target "kubeletconfiguration"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[addons] Applied essential addon: CoreDNS
+[addons] Applied essential addon: kube-proxy
+W1026 10:54:27.083427    4878 postupgrade.go:203] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-env29017121 for kubelet env file. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet env file to /etc/kubernetes/tmp/kubeadm-kubelet-env29017121/kubeadm-flags.env
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+
+$ [cp1] kubectl drain cp3 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+node/cp3 cordoned
+Warning: ignoring DaemonSet-managed Pods: calico-system/calico-node-c9np8, calico-system/csi-node-driver-jxn29, kube-system/kube-proxy-rfd6b
+evicting pod calico-system/calico-typha-5ff7fbc949-rsrf8
+pod/calico-typha-5ff7fbc949-rsrf8 evicted
+node/cp3 drained
+
+$ [cp3] sudo apt-mark unhold kubelet kubectl >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubelet=1.35.9-1.1 kubectl=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubelet kubectl >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart kubelet && kubelet --version
+
+Running kernel seems to be up-to-date.
+
+Services to be restarted:
+ systemctl restart kubelet.service
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Kubernetes v1.35.9
+
+$ [cp1] kubectl uncordon cp3
+node/cp3 uncordoned
+
+$ [cp1] kubectl wait --for=condition=Ready node/cp3 --timeout=300s
+node/cp3 condition met
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   62m   v1.35.9
+cp2    Ready    control-plane   60m   v1.35.9
+cp3    Ready    control-plane   59m   v1.35.9
+w1     Ready    <none>          58m   v1.34.12
+w2     Ready    <none>          58m   v1.34.12
+
+$ [cp1] kubectl -n kube-system get pods -l tier=control-plane -o custom-columns=POD:.metadata.name,IMAGE:.spec.containers[0].image --sort-by=.metadata.name
+POD                           IMAGE
+etcd-cp1                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp2                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp3                      registry.k8s.io/etcd:3.6.6-0
+kube-apiserver-cp1            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp2            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp3            registry.k8s.io/kube-apiserver:v1.35.9
+kube-controller-manager-cp1   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp2   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp3   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-scheduler-cp1            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp2            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp3            registry.k8s.io/kube-scheduler:v1.35.9
+
+########## 4. Workers, one at a time (kubeadm upgrade node -> drain -> kubelet/kubectl -> uncordon)
+
+########## 4.w1 upgrade w1
+
+$ [w1] sudo apt-mark unhold kubeadm >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubeadm=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubeadm >/dev/null && kubeadm version -o short
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+v1.35.9
+
+$ [w1] sudo kubeadm upgrade node 2>&1 | tail -8
+[patches] Applied patch of type "application/strategic-merge-patch+json" to target "kubeletconfiguration"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[upgrade/addon] Skipping the addon/coredns phase. Not a control plane node.
+[upgrade/addon] Skipping the addon/kube-proxy phase. Not a control plane node.
+W1026 10:54:46.748137   18788 postupgrade.go:203] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-env749652937 for kubelet env file. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet env file to /etc/kubernetes/tmp/kubeadm-kubelet-env749652937/kubeadm-flags.env
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+
+$ [cp1] kubectl drain w1 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+node/w1 cordoned
+Warning: ignoring DaemonSet-managed Pods: calico-system/calico-node-q2852, calico-system/csi-node-driver-66tvq, kube-system/kube-proxy-t8lgn
+evicting pod upgrade-demo/nginx-demo-65b8f48cc6-lzrwp
+evicting pod calico-apiserver/calico-apiserver-69dd487547-qbqts
+evicting pod calico-system/calico-kube-controllers-c847ddbcd-pk8mq
+evicting pod calico-system/calico-typha-5ff7fbc949-7t64x
+evicting pod calico-system/goldmane-744d5c978b-wc76p
+error when evicting pods/"calico-typha-5ff7fbc949-7t64x" -n "calico-system" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/goldmane-744d5c978b-wc76p evicted
+evicting pod calico-system/calico-typha-5ff7fbc949-7t64x
+error when evicting pods/"calico-typha-5ff7fbc949-7t64x" -n "calico-system" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/calico-kube-controllers-c847ddbcd-pk8mq evicted
+evicting pod calico-system/calico-typha-5ff7fbc949-7t64x
+pod/nginx-demo-65b8f48cc6-lzrwp evicted
+pod/calico-apiserver-69dd487547-qbqts evicted
+pod/calico-typha-5ff7fbc949-7t64x evicted
+node/w1 drained
+
+$ [cp1] kubectl -n upgrade-demo get pods -o wide
+NAME                          READY   STATUS    RESTARTS   AGE   IP              NODE   NOMINATED NODE   READINESS GATES
+nginx-demo-65b8f48cc6-gf77c   1/1     Running   0          15m   10.244.80.202   w2     <none>           <none>
+nginx-demo-65b8f48cc6-p8rxd   1/1     Running   0          32s   10.244.80.209   w2     <none>           <none>
+
+$ [w1] sudo apt-mark unhold kubelet kubectl >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubelet=1.35.9-1.1 kubectl=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubelet kubectl >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart kubelet && kubelet --version
+
+Running kernel seems to be up-to-date.
+
+Services to be restarted:
+ systemctl restart kubelet.service
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Kubernetes v1.35.9
+
+$ [cp1] kubectl uncordon w1
+node/w1 uncordoned
+
+$ [cp1] kubectl wait --for=condition=Ready node/w1 --timeout=300s
+node/w1 condition met
+
+$ [cp1] kubectl -n upgrade-demo rollout status deployment/nginx-demo --timeout=180s
+deployment "nginx-demo" successfully rolled out
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   62m   v1.35.9
+cp2    Ready    control-plane   61m   v1.35.9
+cp3    Ready    control-plane   60m   v1.35.9
+w1     Ready    <none>          59m   v1.35.9
+w2     Ready    <none>          59m   v1.34.12
+
+########## 4.w2 upgrade w2
+
+$ [w2] sudo apt-mark unhold kubeadm >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubeadm=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubeadm >/dev/null && kubeadm version -o short
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+v1.35.9
+
+$ [w2] sudo kubeadm upgrade node 2>&1 | tail -8
+[patches] Applied patch of type "application/strategic-merge-patch+json" to target "kubeletconfiguration"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[upgrade/addon] Skipping the addon/coredns phase. Not a control plane node.
+[upgrade/addon] Skipping the addon/kube-proxy phase. Not a control plane node.
+W1026 10:55:33.126269   20464 postupgrade.go:203] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-env2583229398 for kubelet env file. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet env file to /etc/kubernetes/tmp/kubeadm-kubelet-env2583229398/kubeadm-flags.env
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+
+$ [cp1] kubectl drain w2 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+node/w2 cordoned
+Warning: ignoring DaemonSet-managed Pods: calico-system/calico-node-5kd8l, calico-system/csi-node-driver-6bq5q, kube-system/kube-proxy-t6lhg
+evicting pod upgrade-demo/nginx-demo-65b8f48cc6-p8rxd
+evicting pod calico-system/calico-kube-controllers-c847ddbcd-5whms
+evicting pod calico-apiserver/calico-apiserver-69dd487547-xx5vh
+evicting pod calico-system/whisker-748f7bccb4-nlrtj
+evicting pod calico-system/calico-typha-5ff7fbc949-9kjj8
+evicting pod calico-system/goldmane-744d5c978b-8wt8f
+evicting pod tigera-operator/tigera-operator-6b5584d9cb-497f7
+evicting pod upgrade-demo/nginx-demo-65b8f48cc6-gf77c
+error when evicting pods/"calico-typha-5ff7fbc949-9kjj8" -n "calico-system" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+error when evicting pods/"nginx-demo-65b8f48cc6-gf77c" -n "upgrade-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/calico-kube-controllers-c847ddbcd-5whms evicted
+pod/tigera-operator-6b5584d9cb-497f7 evicted
+pod/calico-apiserver-69dd487547-xx5vh evicted
+pod/goldmane-744d5c978b-8wt8f evicted
+pod/whisker-748f7bccb4-nlrtj evicted
+evicting pod calico-system/calico-typha-5ff7fbc949-9kjj8
+error when evicting pods/"calico-typha-5ff7fbc949-9kjj8" -n "calico-system" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod upgrade-demo/nginx-demo-65b8f48cc6-gf77c
+evicting pod calico-system/calico-typha-5ff7fbc949-9kjj8
+pod/nginx-demo-65b8f48cc6-p8rxd evicted
+pod/nginx-demo-65b8f48cc6-gf77c evicted
+pod/calico-typha-5ff7fbc949-9kjj8 evicted
+node/w2 drained
+
+$ [cp1] kubectl -n upgrade-demo get pods -o wide
+NAME                          READY   STATUS    RESTARTS   AGE   IP              NODE   NOMINATED NODE   READINESS GATES
+nginx-demo-65b8f48cc6-4d7p7   1/1     Running   0          25s   10.244.190.79   w1     <none>           <none>
+nginx-demo-65b8f48cc6-tlk2v   1/1     Running   0          20s   10.244.190.80   w1     <none>           <none>
+
+$ [w2] sudo apt-mark unhold kubelet kubectl >/dev/null && sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq --allow-change-held-packages kubelet=1.35.9-1.1 kubectl=1.35.9-1.1 >/dev/null && sudo apt-mark hold kubelet kubectl >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart kubelet && kubelet --version
+
+Running kernel seems to be up-to-date.
+
+Services to be restarted:
+ systemctl restart kubelet.service
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Kubernetes v1.35.9
+
+$ [cp1] kubectl uncordon w2
+node/w2 uncordoned
+
+$ [cp1] kubectl wait --for=condition=Ready node/w2 --timeout=300s
+node/w2 condition met
+
+$ [cp1] kubectl -n upgrade-demo rollout status deployment/nginx-demo --timeout=180s
+deployment "nginx-demo" successfully rolled out
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   63m   v1.35.9
+cp2    Ready    control-plane   61m   v1.35.9
+cp3    Ready    control-plane   60m   v1.35.9
+w1     Ready    <none>          60m   v1.35.9
+w2     Ready    <none>          60m   v1.35.9
+
+########## 5. Result: cluster state
+
+$ [cp1] kubectl get nodes -o wide
+NAME   STATUS   ROLES           AGE   VERSION   INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+cp1    Ready    control-plane   63m   v1.35.9   192.168.105.3   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp2    Ready    control-plane   61m   v1.35.9   192.168.105.6   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+cp3    Ready    control-plane   60m   v1.35.9   192.168.105.5   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w1     Ready    <none>          60m   v1.35.9   192.168.105.2   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+w2     Ready    <none>          60m   v1.35.9   192.168.105.4   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic   containerd://2.2.1
+
+$ [cp1] kubectl version
+Client Version: v1.35.9
+Kustomize Version: v5.7.1
+Server Version: v1.35.9
+
+$ [cp1] kubectl -n kube-system get pods -l tier=control-plane -o custom-columns=POD:.metadata.name,IMAGE:.spec.containers[0].image --sort-by=.metadata.name
+POD                           IMAGE
+etcd-cp1                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp2                      registry.k8s.io/etcd:3.6.6-0
+etcd-cp3                      registry.k8s.io/etcd:3.6.6-0
+kube-apiserver-cp1            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp2            registry.k8s.io/kube-apiserver:v1.35.9
+kube-apiserver-cp3            registry.k8s.io/kube-apiserver:v1.35.9
+kube-controller-manager-cp1   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp2   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-controller-manager-cp3   registry.k8s.io/kube-controller-manager:v1.35.9
+kube-scheduler-cp1            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp2            registry.k8s.io/kube-scheduler:v1.35.9
+kube-scheduler-cp3            registry.k8s.io/kube-scheduler:v1.35.9
+
+$ [cp1] kubectl get tigerastatus
+NAME        AVAILABLE   PROGRESSING   DEGRADED   SINCE
+apiserver   True        False         False      2s
+calico      True        False         False      72s
+goldmane    True        False         False      7s
+ippools     True        False         False      63m
+whisker     True        False         False      9m30s
+
+$ [cp1] kubectl get pods -A --no-headers | grep -v -E "Running|Completed" || echo "all pods Running/Completed"
+all pods Running/Completed
+
+$ [cp1] kubectl -n upgrade-demo get deploy,pdb,pods -o wide
+NAME                         READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES         SELECTOR
+deployment.apps/nginx-demo   2/2     2            2           16m   nginx        nginx:stable   app=nginx-demo
+
+NAME                                    MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+poddisruptionbudget.policy/nginx-demo   1               N/A               1                     16m
+
+NAME                              READY   STATUS    RESTARTS   AGE   IP              NODE   NOMINATED NODE   READINESS GATES
+pod/nginx-demo-65b8f48cc6-4d7p7   1/1     Running   0          36s   10.244.190.79   w1     <none>           <none>
+pod/nginx-demo-65b8f48cc6-tlk2v   1/1     Running   0          31s   10.244.190.80   w1     <none>           <none>
+
+########## 6. Result: the probe log (HTTP 200 = answered; 000 = no answer within 1s)
+probe window: 10:39:39 -> 10:56:11
+./c-upgrade.sh: line 96:  3455 Terminated: 15          "$DIR/probe.sh" "$PLOG" "$u"
+./c-upgrade.sh: line 96:  3456 Terminated: 15          "$DIR/probe.sh" "$PLOG" "$u"
+./c-upgrade.sh: line 96:  3457 Terminated: 15          "$DIR/probe.sh" "$PLOG" "$u"
+http://192.168.105.2:30080/                   probes=826   failed=0
+http://192.168.105.4:30080/                   probes=826   failed=0
+https://192.168.105.200:6443/healthz          probes=816   failed=7
+failed probes (if any):
+10:47:33 https://192.168.105.200:6443/healthz 000
+10:47:34 https://192.168.105.200:6443/healthz 500
+10:47:36 https://192.168.105.200:6443/healthz 000
+10:47:38 https://192.168.105.200:6443/healthz 000
+10:51:38 https://192.168.105.200:6443/healthz 000
+10:51:40 https://192.168.105.200:6443/healthz 000
+10:51:42 https://192.168.105.200:6443/healthz 000

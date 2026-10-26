@@ -1,0 +1,230 @@
+
+########## 0. Tooling: etcdutl/etcdctl matching the running etcd version on every control plane
+running etcd version: 3.6.5
+
+$ [cp1] curl -fsSL https://github.com/etcd-io/etcd/releases/download/v3.6.5/etcd-v3.6.5-linux-arm64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin etcd-v3.6.5-linux-arm64/etcdctl etcd-v3.6.5-linux-arm64/etcdutl && etcdutl version | head -1
+etcdutl version: 3.6.5
+
+$ [cp2] curl -fsSL https://github.com/etcd-io/etcd/releases/download/v3.6.5/etcd-v3.6.5-linux-arm64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin etcd-v3.6.5-linux-arm64/etcdctl etcd-v3.6.5-linux-arm64/etcdutl && etcdutl version | head -1
+etcdutl version: 3.6.5
+
+$ [cp3] curl -fsSL https://github.com/etcd-io/etcd/releases/download/v3.6.5/etcd-v3.6.5-linux-arm64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin etcd-v3.6.5-linux-arm64/etcdctl etcd-v3.6.5-linux-arm64/etcdutl && etcdutl version | head -1
+etcdutl version: 3.6.5
+
+########## 1. Create a namespace with some resources
+
+$ [cp1] kubectl create namespace backup-demo
+namespace/backup-demo created
+
+$ [cp1] kubectl -n backup-demo create deployment web --image=nginx --replicas=2
+deployment.apps/web created
+
+$ [cp1] kubectl -n backup-demo create configmap app-config --from-literal=greeting=hello-from-before-the-backup
+configmap/app-config created
+
+$ [cp1] kubectl -n backup-demo create secret generic app-secret --from-literal=password=s3cr3t
+secret/app-secret created
+
+$ [cp1] kubectl -n backup-demo expose deployment web --port=80
+service/web exposed
+
+$ [cp1] kubectl -n backup-demo rollout status deployment/web --timeout=180s
+Waiting for deployment "web" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 1 of 2 updated replicas are available...
+deployment "web" successfully rolled out
+
+$ [cp1] kubectl -n backup-demo get deploy,po,svc,cm,secret
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   2/2     2            2           2s
+
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/web-64c966cf88-cjf9d   1/1     Running   0          2s
+pod/web-64c966cf88-nntdr   1/1     Running   0          2s
+
+NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+service/web   ClusterIP   10.106.85.176   <none>        80/TCP    2s
+
+NAME                         DATA   AGE
+configmap/app-config         1      2s
+configmap/kube-root-ca.crt   1      3s
+
+NAME                TYPE     DATA   AGE
+secret/app-secret   Opaque   1      2s
+
+########## 2. Take the snapshot (etcdctl snapshot save, from the local member) and verify it
+
+$ [cp1] sudo mkdir -p /var/backups && kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /var/lib/etcd/snapshot.db
+{"level":"info","ts":"2026-10-26T09:37:21.920125Z","caller":"snapshot/v3_snapshot.go:83","msg":"created temporary db file","path":"/var/lib/etcd/snapshot.db.part"}
+{"level":"info","ts":"2026-10-26T09:37:21.925001Z","logger":"client","caller":"v3@v3.6.5/maintenance.go:236","msg":"opened snapshot stream; downloading"}
+{"level":"info","ts":"2026-10-26T09:37:21.928277Z","caller":"snapshot/v3_snapshot.go:96","msg":"fetching snapshot","endpoint":"https://127.0.0.1:2379"}
+{"level":"info","ts":"2026-10-26T09:37:21.991445Z","logger":"client","caller":"v3@v3.6.5/maintenance.go:302","msg":"completed snapshot read; closing"}
+{"level":"info","ts":"2026-10-26T09:37:21.997318Z","caller":"snapshot/v3_snapshot.go:111","msg":"fetched snapshot","endpoint":"https://127.0.0.1:2379","size":"13 MB","took":"74.183965ms","etcd-version":"3.6.0"}
+{"level":"info","ts":"2026-10-26T09:37:21.997512Z","caller":"snapshot/v3_snapshot.go:121","msg":"saved","path":"/var/lib/etcd/snapshot.db"}
+Snapshot saved at /var/lib/etcd/snapshot.db
+Server version 3.6.0
+
+$ [cp1] sudo mv /var/lib/etcd/snapshot.db /var/backups/etcd-20261026-103707.db && sudo chown $(id -u):$(id -g) /var/backups/etcd-20261026-103707.db && chmod 600 /var/backups/etcd-20261026-103707.db && ls -l /var/backups/etcd-20261026-103707.db
+-rw------- 1 johnsmith johnsmith 12701728 Oct 26 10:37 /var/backups/etcd-20261026-103707.db
+
+$ [cp1] etcdutl snapshot status /var/backups/etcd-20261026-103707.db -w table
++----------+----------+------------+------------+---------+
+|   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE | VERSION |
++----------+----------+------------+------------+---------+
+| ca5600d7 |    11617 |       1157 |      13 MB |   3.6.0 |
++----------+----------+------------+------------+---------+
+
+########## 3. Make a change AFTER the snapshot (it must be lost by the restore) and then 'accidentally' delete the namespace
+
+$ [cp1] kubectl create configmap created-after-backup -n default --from-literal=note=i-will-not-survive-the-restore
+configmap/created-after-backup created
+
+$ [cp1] kubectl delete namespace backup-demo --wait=true
+namespace "backup-demo" deleted
+
+$ [cp1] kubectl get namespace
+NAME               STATUS   AGE
+calico-apiserver   Active   44m
+calico-system      Active   44m
+default            Active   44m
+kube-node-lease    Active   44m
+kube-public        Active   44m
+kube-system        Active   44m
+tigera-operator    Active   44m
+
+$ [cp1] kubectl get all -n backup-demo
+No resources found in backup-demo namespace.
+
+########## 4. Restore. Copy the snapshot to every control plane
+initial-cluster: cp1=https://192.168.105.3:2380,cp2=https://192.168.105.6:2380,cp3=https://192.168.105.5:2380
+
+########## 4a. Stop kube-apiserver and etcd on ALL control planes (move their static-pod manifests away)
+
+$ [cp1] sudo mkdir -p /etc/kubernetes/manifests-stopped && sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/etcd.yaml /etc/kubernetes/manifests-stopped/
+
+$ [cp2] sudo mkdir -p /etc/kubernetes/manifests-stopped && sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/etcd.yaml /etc/kubernetes/manifests-stopped/
+
+$ [cp3] sudo mkdir -p /etc/kubernetes/manifests-stopped && sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/etcd.yaml /etc/kubernetes/manifests-stopped/
+
+$ [cp1] for i in $(seq 1 60); do ss -tln | grep -qE ":(2379|6443) " || break; sleep 2; done; if ss -tln | grep -qE ":(2379|6443) "; then echo STILL-RUNNING; else echo "etcd and kube-apiserver are stopped"; fi
+etcd and kube-apiserver are stopped
+
+$ [cp2] for i in $(seq 1 60); do ss -tln | grep -qE ":(2379|6443) " || break; sleep 2; done; if ss -tln | grep -qE ":(2379|6443) "; then echo STILL-RUNNING; else echo "etcd and kube-apiserver are stopped"; fi
+etcd and kube-apiserver are stopped
+
+$ [cp3] for i in $(seq 1 60); do ss -tln | grep -qE ":(2379|6443) " || break; sleep 2; done; if ss -tln | grep -qE ":(2379|6443) "; then echo STILL-RUNNING; else echo "etcd and kube-apiserver are stopped"; fi
+etcd and kube-apiserver are stopped
+
+########## 4b. On every member: keep the old data dir, restore the snapshot into a new one
+
+$ [cp1] sudo mv /var/lib/etcd /var/lib/etcd.pre-restore-20261026-103707 && sudo etcdutl snapshot restore /tmp/etcd-snapshot.db --name cp1 --initial-cluster 'cp1=https://192.168.105.3:2380,cp2=https://192.168.105.6:2380,cp3=https://192.168.105.5:2380' --initial-cluster-token etcd-restore-20261026-103707 --initial-advertise-peer-urls https://192.168.105.3:2380 --data-dir /var/lib/etcd 2>&1 | tail -4; sudo ls /var/lib/etcd/member
+2026-10-26T10:37:54+01:00	info	membership/cluster.go:424	added member	{"cluster-id": "d0f19882ff85f7fc", "local-member-id": "0", "added-peer-id": "fc55a7addb82a14f", "added-peer-peer-urls": ["https://192.168.105.6:2380"], "added-peer-is-learner": false}
+2026-10-26T10:37:54+01:00	info	bbolt	backend/backend.go:203	Opening db file (/var/lib/etcd/member/snap/db) with mode -rw------- and with options: {Timeout: 0s, NoGrowSync: false, NoFreelistSync: true, PreLoadFreelist: false, FreelistType: , ReadOnly: false, MmapFlags: 8000, InitialMmapSize: 10737418240, PageSize: 0, NoSync: false, OpenFile: 0x0, Mlock: false, Logger: 0x400005c9e0}
+2026-10-26T10:37:54+01:00	info	bbolt	bbolt@v1.4.3/db.go:321	Opening bbolt db (/var/lib/etcd/member/snap/db) successfully
+2026-10-26T10:37:54+01:00	info	snapshot/v3_snapshot.go:333	restored snapshot	{"path": "/tmp/etcd-snapshot.db", "wal-dir": "/var/lib/etcd/member/wal", "data-dir": "/var/lib/etcd", "snap-dir": "/var/lib/etcd/member/snap", "initial-memory-map-size": 10737418240}
+snap
+wal
+
+$ [cp2] sudo mv /var/lib/etcd /var/lib/etcd.pre-restore-20261026-103707 && sudo etcdutl snapshot restore /tmp/etcd-snapshot.db --name cp2 --initial-cluster 'cp1=https://192.168.105.3:2380,cp2=https://192.168.105.6:2380,cp3=https://192.168.105.5:2380' --initial-cluster-token etcd-restore-20261026-103707 --initial-advertise-peer-urls https://192.168.105.6:2380 --data-dir /var/lib/etcd 2>&1 | tail -4; sudo ls /var/lib/etcd/member
+2026-10-26T10:37:54+01:00	info	membership/cluster.go:424	added member	{"cluster-id": "d0f19882ff85f7fc", "local-member-id": "0", "added-peer-id": "fc55a7addb82a14f", "added-peer-peer-urls": ["https://192.168.105.6:2380"], "added-peer-is-learner": false}
+2026-10-26T10:37:54+01:00	info	bbolt	backend/backend.go:203	Opening db file (/var/lib/etcd/member/snap/db) with mode -rw------- and with options: {Timeout: 0s, NoGrowSync: false, NoFreelistSync: true, PreLoadFreelist: false, FreelistType: , ReadOnly: false, MmapFlags: 8000, InitialMmapSize: 10737418240, PageSize: 0, NoSync: false, OpenFile: 0x0, Mlock: false, Logger: 0x40001162a0}
+2026-10-26T10:37:54+01:00	info	bbolt	bbolt@v1.4.3/db.go:321	Opening bbolt db (/var/lib/etcd/member/snap/db) successfully
+2026-10-26T10:37:54+01:00	info	snapshot/v3_snapshot.go:333	restored snapshot	{"path": "/tmp/etcd-snapshot.db", "wal-dir": "/var/lib/etcd/member/wal", "data-dir": "/var/lib/etcd", "snap-dir": "/var/lib/etcd/member/snap", "initial-memory-map-size": 10737418240}
+snap
+wal
+
+$ [cp3] sudo mv /var/lib/etcd /var/lib/etcd.pre-restore-20261026-103707 && sudo etcdutl snapshot restore /tmp/etcd-snapshot.db --name cp3 --initial-cluster 'cp1=https://192.168.105.3:2380,cp2=https://192.168.105.6:2380,cp3=https://192.168.105.5:2380' --initial-cluster-token etcd-restore-20261026-103707 --initial-advertise-peer-urls https://192.168.105.5:2380 --data-dir /var/lib/etcd 2>&1 | tail -4; sudo ls /var/lib/etcd/member
+2026-10-26T10:37:54+01:00	info	membership/cluster.go:424	added member	{"cluster-id": "d0f19882ff85f7fc", "local-member-id": "0", "added-peer-id": "fc55a7addb82a14f", "added-peer-peer-urls": ["https://192.168.105.6:2380"], "added-peer-is-learner": false}
+2026-10-26T10:37:54+01:00	info	bbolt	backend/backend.go:203	Opening db file (/var/lib/etcd/member/snap/db) with mode -rw------- and with options: {Timeout: 0s, NoGrowSync: false, NoFreelistSync: true, PreLoadFreelist: false, FreelistType: , ReadOnly: false, MmapFlags: 8000, InitialMmapSize: 10737418240, PageSize: 0, NoSync: false, OpenFile: 0x0, Mlock: false, Logger: 0x40003100e0}
+2026-10-26T10:37:54+01:00	info	bbolt	bbolt@v1.4.3/db.go:321	Opening bbolt db (/var/lib/etcd/member/snap/db) successfully
+2026-10-26T10:37:54+01:00	info	snapshot/v3_snapshot.go:333	restored snapshot	{"path": "/tmp/etcd-snapshot.db", "wal-dir": "/var/lib/etcd/member/wal", "data-dir": "/var/lib/etcd", "snap-dir": "/var/lib/etcd/member/snap", "initial-memory-map-size": 10737418240}
+snap
+wal
+
+########## 4c. Start etcd on all members, then kube-apiserver
+
+$ [cp1] sudo mv /etc/kubernetes/manifests-stopped/etcd.yaml /etc/kubernetes/manifests/
+
+$ [cp2] sudo mv /etc/kubernetes/manifests-stopped/etcd.yaml /etc/kubernetes/manifests/
+
+$ [cp3] sudo mv /etc/kubernetes/manifests-stopped/etcd.yaml /etc/kubernetes/manifests/
+
+$ [cp1] sudo mv /etc/kubernetes/manifests-stopped/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+$ [cp2] sudo mv /etc/kubernetes/manifests-stopped/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+$ [cp3] sudo mv /etc/kubernetes/manifests-stopped/kube-apiserver.yaml /etc/kubernetes/manifests/
+API on https://192.168.105.200:6443 healthy after ~1s
+
+########## 5. Verify: the namespace and its resources are back, the post-snapshot change is gone
+
+$ [cp1] kubectl get nodes
+NAME   STATUS   ROLES           AGE   VERSION
+cp1    Ready    control-plane   45m   v1.34.12
+cp2    Ready    control-plane   44m   v1.34.12
+cp3    Ready    control-plane   42m   v1.34.12
+w1     Ready    <none>          42m   v1.34.12
+w2     Ready    <none>          42m   v1.34.12
+
+$ [cp1] kubectl get namespace backup-demo
+NAME          STATUS   AGE
+backup-demo   Active   59s
+
+$ [cp1] kubectl -n backup-demo rollout status deployment/web --timeout=240s
+deployment "web" successfully rolled out
+
+$ [cp1] kubectl -n backup-demo get deploy,po,svc,cm,secret
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   2/2     2            2           59s
+
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/web-64c966cf88-cjf9d   1/1     Running   0          59s
+pod/web-64c966cf88-nntdr   1/1     Running   0          59s
+
+NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+service/web   ClusterIP   10.106.85.176   <none>        80/TCP    59s
+
+NAME                         DATA   AGE
+configmap/app-config         1      59s
+configmap/kube-root-ca.crt   1      60s
+
+NAME                TYPE     DATA   AGE
+secret/app-secret   Opaque   1      59s
+
+$ [cp1] kubectl -n backup-demo get configmap app-config -o jsonpath='{.data.greeting}{"\n"}'
+hello-from-before-the-backup
+
+$ [cp1] kubectl -n backup-demo get secret app-secret -o jsonpath='{.data.password}' | base64 -d; echo
+s3cr3t
+
+$ [cp1] kubectl get configmap created-after-backup -n default
+Error from server (NotFound): configmaps "created-after-backup" not found
+-> NotFound, as expected: everything written after the snapshot is lost
+
+########## 6. etcd and cluster health after the restore
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key member list -w table
++------------------+---------+------+----------------------------+----------------------------+------------+
+|        ID        | STATUS  | NAME |         PEER ADDRS         |        CLIENT ADDRS        | IS LEARNER |
++------------------+---------+------+----------------------------+----------------------------+------------+
+| 3ba97e8154ade4ea | started |  cp1 | https://192.168.105.3:2380 | https://192.168.105.3:2379 |      false |
+| 4b1142d090030d50 | started |  cp3 | https://192.168.105.5:2380 | https://192.168.105.5:2379 |      false |
+| fc55a7addb82a14f | started |  cp2 | https://192.168.105.6:2380 | https://192.168.105.6:2379 |      false |
++------------------+---------+------+----------------------------+----------------------------+------------+
+
+$ [cp1] kubectl -n kube-system exec etcd-cp1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key endpoint health --cluster -w table
++----------------------------+--------+------------+-------+
+|          ENDPOINT          | HEALTH |    TOOK    | ERROR |
++----------------------------+--------+------------+-------+
+| https://192.168.105.3:2379 |   true | 4.996757ms |       |
+| https://192.168.105.5:2379 |   true |  5.02759ms |       |
+| https://192.168.105.6:2379 |   true | 7.259038ms |       |
++----------------------------+--------+------------+-------+
+
+$ [cp1] kubectl get pods -A --no-headers | grep -v -E "Running|Completed" || echo "all pods Running"
+backup-demo        web-64c966cf88-nntdr                      0/1   ContainerCreating            1               59s
+tigera-operator    tigera-operator-6b5584d9cb-kbg5c          0/1   CreateContainerConfigError   1 (34s ago)     45m
+
+########## 7. Clean up the demo namespace (old data dirs are kept on the nodes as /var/lib/etcd.pre-restore-20261026-103707)
+
+$ [cp1] kubectl delete namespace backup-demo --wait=false
+namespace "backup-demo" deleted
