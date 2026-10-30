@@ -1,0 +1,27 @@
+# Crossplane composes plain Kubernetes objects (no cloud providers involved). It must be allowed to
+# manage exactly these kinds, nothing more. The aggregate-to-crossplane label merges this role into
+# Crossplane's own ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crossplane-teamenvironment
+  labels:
+    rbac.crossplane.io/aggregate-to-crossplane: "true"
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, resourcequotas, limitranges]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # creating a RoleBinding to a role needs either that role's permissions or the "bind" verb on it
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [edit, view]
+    verbs: [bind]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [argoproj.io]
+    resources: [applications, appprojects]
+    verbs: [get, list, watch, create, update, patch, delete]

@@ -1,0 +1,184 @@
+# Turns one TeamEnvironment into: Namespace, ResourceQuota, LimitRange, RoleBinding, default-deny
+# + DNS NetworkPolicies, an Argo CD AppProject (guard rails) and an Argo CD Application (the team's repo).
+# Deleting the TeamEnvironment garbage-collects all of them.
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: teamenvironment
+spec:
+  compositeTypeRef:
+    apiVersion: platform.kiratech.io/v1alpha1
+    kind: TeamEnvironment
+  mode: Pipeline
+  pipeline:
+    - step: render
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $xr := .observed.composite.resource -}}
+            {{- $team := $xr.spec.teamName -}}
+            {{- $ns := printf "team-%s" $team -}}
+            {{- $group := default (printf "team-%s-devs" $team) $xr.spec.group -}}
+            {{- $sizes := dict
+                  "S" (dict "reqCpu" "500m" "reqMem" "512Mi" "limCpu" "1"  "limMem" "1Gi" "pods" "10" "defReqCpu" "50m"  "defReqMem" "64Mi"  "defLimCpu" "250m" "defLimMem" "256Mi" "maxCpu" "500m" "maxMem" "512Mi")
+                  "M" (dict "reqCpu" "1"    "reqMem" "1Gi"   "limCpu" "2"  "limMem" "2Gi" "pods" "20" "defReqCpu" "100m" "defReqMem" "128Mi" "defLimCpu" "500m" "defLimMem" "512Mi" "maxCpu" "1"    "maxMem" "1Gi")
+                  "L" (dict "reqCpu" "2"    "reqMem" "2Gi"   "limCpu" "4"  "limMem" "4Gi" "pods" "40" "defReqCpu" "100m" "defReqMem" "128Mi" "defLimCpu" "500m" "defLimMem" "512Mi" "maxCpu" "2"    "maxMem" "2Gi") -}}
+            {{- $s := index $sizes $xr.spec.size -}}
+            ---
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: {{ $ns }}
+              labels:
+                platform.kiratech.io/team: {{ $team }}
+                platform.kiratech.io/size: {{ $xr.spec.size }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: namespace
+                gotemplating.fn.crossplane.io/ready: "True"
+            ---
+            apiVersion: v1
+            kind: ResourceQuota
+            metadata:
+              name: team-quota
+              namespace: {{ $ns }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: quota
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              hard:
+                requests.cpu: {{ $s.reqCpu | quote }}
+                requests.memory: {{ $s.reqMem | quote }}
+                limits.cpu: {{ $s.limCpu | quote }}
+                limits.memory: {{ $s.limMem | quote }}
+                pods: {{ $s.pods | quote }}
+            ---
+            apiVersion: v1
+            kind: LimitRange
+            metadata:
+              name: team-limits
+              namespace: {{ $ns }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: limitrange
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              limits:
+                - type: Container
+                  defaultRequest:
+                    cpu: {{ $s.defReqCpu | quote }}
+                    memory: {{ $s.defReqMem | quote }}
+                  default:
+                    cpu: {{ $s.defLimCpu | quote }}
+                    memory: {{ $s.defLimMem | quote }}
+                  max:
+                    cpu: {{ $s.maxCpu | quote }}
+                    memory: {{ $s.maxMem | quote }}
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: team-edit
+              namespace: {{ $ns }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: rolebinding
+                gotemplating.fn.crossplane.io/ready: "True"
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: edit
+            subjects:
+              - apiGroup: rbac.authorization.k8s.io
+                kind: Group
+                name: {{ $group | quote }}
+            ---
+            apiVersion: networking.k8s.io/v1
+            kind: NetworkPolicy
+            metadata:
+              name: default-deny-all
+              namespace: {{ $ns }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: netpol-default-deny
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              podSelector: {}
+              policyTypes: [Ingress, Egress]
+            ---
+            apiVersion: networking.k8s.io/v1
+            kind: NetworkPolicy
+            metadata:
+              name: allow-dns
+              namespace: {{ $ns }}
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: netpol-allow-dns
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              # Name resolution is needed by practically every workload; without it default-deny
+              # makes "db" unresolvable (the classic "nslookup: connection timed out").
+              podSelector: {}
+              policyTypes: [Egress]
+              egress:
+                - to:
+                    - namespaceSelector:
+                        matchLabels:
+                          kubernetes.io/metadata.name: kube-system
+                      podSelector:
+                        matchLabels:
+                          k8s-app: kube-dns
+                  ports:
+                    - { protocol: UDP, port: 53 }
+                    - { protocol: TCP, port: 53 }
+            ---
+            apiVersion: argoproj.io/v1alpha1
+            kind: AppProject
+            metadata:
+              name: {{ $ns }}
+              namespace: argocd
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: argocd-project
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              description: "Guard rails for {{ $ns }} - only its own repository, only its own namespace"
+              sourceRepos:
+                - {{ $xr.spec.repoURL | quote }}
+              destinations:
+                - server: https://kubernetes.default.svc
+                  namespace: {{ $ns }}
+              # no cluster-scoped resources, and the team cannot touch what the platform owns
+              clusterResourceWhitelist: []
+              namespaceResourceBlacklist:
+                - { group: "", kind: ResourceQuota }
+                - { group: "", kind: LimitRange }
+                - { group: rbac.authorization.k8s.io, kind: Role }
+                - { group: rbac.authorization.k8s.io, kind: RoleBinding }
+            ---
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: {{ $ns }}
+              namespace: argocd
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: argocd-application
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              project: {{ $ns }}
+              source:
+                repoURL: {{ $xr.spec.repoURL | quote }}
+                targetRevision: {{ $xr.spec.targetRevision | quote }}
+                path: {{ $xr.spec.path | quote }}
+              destination:
+                server: https://kubernetes.default.svc
+                namespace: {{ $ns }}
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                retry:
+                  limit: 10
+                  backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+    - step: auto-ready
+      functionRef:
+        name: function-auto-ready

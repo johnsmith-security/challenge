@@ -1,0 +1,14 @@
+# Exposes the Argo CD web UI/API to the Mac (lab only: plain HTTP, NodePort).
+# http://<any node IP>:30090   user "admin", password in secret argocd/argocd-initial-admin-secret
+# In production: Ingress + TLS + SSO, no NodePort.
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-nodeport
+  namespace: argocd
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: argocd-server
+  ports:
+    - { name: http, port: 80, targetPort: 8080, nodePort: 30090 }

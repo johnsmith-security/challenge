@@ -1,0 +1,80 @@
+# The only things applied by hand (by bootstrap-platform.sh). Everything else is reconciled from Git.
+# A dedicated "platform" AppProject instead of "default": it limits these apps to the platform-config repo.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  description: Platform-owned configuration (Crossplane API, team environments)
+  sourceRepos:
+    - http://gitea-http.gitea.svc.cluster.local:3000/platform/platform-config.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  clusterResourceWhitelist:
+    - { group: "*", kind: "*" }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-api
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: http://gitea-http.gitea.svc.cluster.local:3000/platform/platform-config.git
+    targetRevision: main
+    path: crossplane
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [SkipDryRunOnMissingResource=true]
+    retry:
+      limit: 20
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-maintenance
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: http://gitea-http.gitea.svc.cluster.local:3000/platform/platform-config.git
+    targetRevision: main
+    path: cluster-maintenance
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry:
+      limit: 20
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: team-environments
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: http://gitea-http.gitea.svc.cluster.local:3000/platform/platform-config.git
+    targetRevision: main
+    path: environments
+    directory: { recurse: true }
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    # allowEmpty: removing the LAST environment file leaves zero manifests; without this flag Argo CD
+    # refuses to sync ("auto-sync will wipe out all resources") and the environment would never be deleted.
+    # Risk: an accidental empty commit deletes every environment, so protect the branch (reviews) in production.
+    automated: { prune: true, selfHeal: true, allowEmpty: true }
+    # the TeamEnvironment CRD only exists once platform-api has synced the XRD
+    syncOptions: [SkipDryRunOnMissingResource=true]
+    retry:
+      limit: 20
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }

@@ -1,0 +1,74 @@
+# Demo workload of team "blue": api -> db, running under the platform's default-deny NetworkPolicy.
+# Demo only: the database runs without a password ("trust"). Real teams must inject credentials from a
+# secret manager (External Secrets / Sealed Secrets), never commit them here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  labels: { app: db }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: db }
+  template:
+    metadata:
+      labels: { app: db }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_HOST_AUTH_METHOD, value: trust }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec: { command: [pg_isready, -U, postgres] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  selector: { app: db }
+  ports:
+    - { port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels: { app: api }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: busybox:1.28
+          # tiny HTTP server standing in for the real API
+          command: [sh, -c, "mkdir -p /www && echo api-ok > /www/index.html && exec httpd -f -p 8080 -h /www"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector: { app: api }
+  ports:
+    - { port: 8080, targetPort: 8080 }

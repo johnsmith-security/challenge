@@ -1,0 +1,97 @@
+# Keeps Calico's CNI credentials fresh on a laptop lab.
+#
+# Problem: calico-node writes a 24 h token to /etc/cni/net.d/calico-kubeconfig and refreshes it after 6-12 h
+# measured with the guest's MONOTONIC clock. When the Mac sleeps, the Lima VMs are paused: the monotonic clock
+# stops, the wall clock keeps going, the token expires first and every NEW pod stays in ContainerCreating with
+# "plugin type=calico failed (add): connection is unauthorized: Unauthorized". (Running pods are not affected.)
+#
+# Fix: restart calico-node on a WALL-CLOCK schedule (the CronJob controller schedules by wall clock, so after a
+# long sleep it runs the missed job right after wake-up). A restart makes calico-node write a fresh token at once.
+# The pod uses hostNetwork on purpose: it must be able to start even when pod networking is broken.
+#
+# Not needed on VMs that never pause (production), where it is harmless; there, alert on the age of the token instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-maintenance
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: calico-cni-token-refresh
+  namespace: platform-maintenance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: calico-node-restarter
+  namespace: calico-system
+rules:
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    resourceNames: [calico-node]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: calico-node-restarter
+  namespace: calico-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: calico-node-restarter
+subjects:
+  - kind: ServiceAccount
+    name: calico-cni-token-refresh
+    namespace: platform-maintenance
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: calico-cni-token-refresh
+  namespace: platform-maintenance
+spec:
+  schedule: "0 */6 * * *" # every 6 h (UTC); the token lives 24 h
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: calico-cni-token-refresh
+          restartPolicy: Never
+          hostNetwork: true # no CNI call needed to start this pod
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          initContainers:
+            - name: restart
+              image: registry.k8s.io/kubectl:v1.35.9
+              args: ["-n", "calico-system", "rollout", "restart", "daemonset/calico-node"]
+              env: &env
+                - { name: HOME, value: /tmp }
+              securityContext: &sc
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: [ALL] }
+              volumeMounts: &vm
+                - { name: tmp, mountPath: /tmp }
+              resources: &res
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { memory: 128Mi }
+          containers:
+            - name: wait
+              image: registry.k8s.io/kubectl:v1.35.9
+              args: ["-n", "calico-system", "rollout", "status", "daemonset/calico-node", "--timeout=600s"]
+              env: *env
+              securityContext: *sc
+              volumeMounts: *vm
+              resources: *res
+          volumes:
+            - { name: tmp, emptyDir: {} }

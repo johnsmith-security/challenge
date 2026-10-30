@@ -1,0 +1,70 @@
+# The self-service API: kubectl get teamenvironments / kubectl apply -f <team>.yaml
+# Validation lives here, so the API server rejects bad requests at admission time.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: teamenvironments.platform.kiratech.io
+spec:
+  scope: Cluster # one TeamEnvironment creates a Namespace, so it cannot be namespaced itself
+  group: platform.kiratech.io
+  names:
+    kind: TeamEnvironment
+    plural: teamenvironments
+    singular: teamenvironment
+    shortNames: [tenv]
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      additionalPrinterColumns:
+        - name: team
+          type: string
+          jsonPath: .spec.teamName
+        - name: size
+          type: string
+          jsonPath: .spec.size
+        - name: repo
+          type: string
+          jsonPath: .spec.repoURL
+          priority: 1
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "A team environment: namespace, quota, limits, RBAC, default-deny network policy and a GitOps Application."
+          x-kubernetes-validations:
+            - rule: "self.metadata.name == self.spec.teamName"
+              message: "metadata.name must equal spec.teamName (one environment per team)"
+          properties:
+            spec:
+              type: object
+              required: [teamName, size, repoURL]
+              properties:
+                teamName:
+                  type: string
+                  description: Team identifier. The namespace will be team-<teamName>. Cannot be changed afterwards.
+                  minLength: 2
+                  maxLength: 20
+                  pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "teamName is immutable (changing it would delete the namespace)"
+                size:
+                  type: string
+                  description: "Environment size. S: 0.5 CPU / 512Mi requests, M: 1 CPU / 1Gi, L: 2 CPU / 2Gi."
+                  enum: [S, M, L]
+                repoURL:
+                  type: string
+                  description: Git repository with the team's manifests (Argo CD syncs it into the namespace).
+                  pattern: '^https?://[^\s/]+(/[^\s]*)?$'
+                path:
+                  type: string
+                  description: Directory of the repository to deploy.
+                  default: deploy
+                targetRevision:
+                  type: string
+                  description: Branch, tag or commit to deploy.
+                  default: HEAD
+                group:
+                  type: string
+                  description: Identity-provider group that gets the "edit" role in the namespace. Defaults to team-<teamName>-devs.
+                  pattern: '^[A-Za-z0-9][-A-Za-z0-9_.:@]*$'

@@ -1,0 +1,51 @@
+C4Deployment
+  title Deployment diagram: kubeadm HA cluster on 5 Lima VMs (stacked etcd, kube-vip, Calico)
+
+  Deployment_Node(mac, "MacBook (macOS, Apple Silicon)", "Lima 2.x, vz VMs") {
+    Container(cli, "kubectl / browser", "~/.kube/lima-ha.conf", "Talks only to the VIP")
+
+    Deployment_Node(net, "lima: shared network", "socket_vmnet, 192.168.105.0/24. Pod network 10.244.0.0/16 (Calico BGP, no encapsulation inside one subnet)") {
+      Container(vip, "API endpoint (VIP)", "192.168.105.200:6443", "Held by the kube-vip leader (one control plane at a time), moved by gratuitous ARP on failover. Used by kubectl, kubelets and kube-proxy")
+
+      Deployment_Node(cp1, "cp1 VM", "Ubuntu 24.04, 2 vCPU / 2.5 GiB, 192.168.105.3") {
+        Container(api1, "kube-apiserver", "static pod", "+ controller-manager, scheduler")
+        ContainerDb(etcd1, "etcd member", "static pod, stacked", ":2379 client, :2380 peer")
+        Container(kv1, "kube-vip", "static pod", "ARP, leader election")
+        Container(cal1, "calico-node", "DaemonSet", "Pod routes, NetworkPolicy")
+      }
+      Deployment_Node(cp2, "cp2 VM", "Ubuntu 24.04, 2 vCPU / 2.5 GiB, 192.168.105.6") {
+        Container(api2, "kube-apiserver", "static pod", "+ controller-manager, scheduler")
+        ContainerDb(etcd2, "etcd member", "static pod, stacked", ":2379 client, :2380 peer")
+        Container(kv2, "kube-vip", "static pod", "ARP, leader election")
+        Container(cal2, "calico-node", "DaemonSet", "Pod routes, NetworkPolicy")
+      }
+      Deployment_Node(cp3, "cp3 VM", "Ubuntu 24.04, 2 vCPU / 2.5 GiB, 192.168.105.5") {
+        Container(api3, "kube-apiserver", "static pod", "+ controller-manager, scheduler")
+        ContainerDb(etcd3, "etcd member", "static pod, stacked", ":2379 client, :2380 peer")
+        Container(kv3, "kube-vip", "static pod", "ARP, leader election")
+        Container(cal3, "calico-node", "DaemonSet", "Pod routes, NetworkPolicy")
+      }
+      Deployment_Node(w1, "w1 VM", "Ubuntu 24.04, 2 vCPU / 3 GiB, 192.168.105.2") {
+        Container(k1, "kubelet + containerd", "systemd", "Runs workload Pods, reaches the API via the VIP")
+        Container(cal4, "calico-node", "DaemonSet", "Pod routes, NetworkPolicy")
+      }
+      Deployment_Node(w2, "w2 VM", "Ubuntu 24.04, 2 vCPU / 3 GiB, 192.168.105.4") {
+        Container(k2, "kubelet + containerd", "systemd", "Runs workload Pods, reaches the API via the VIP")
+        Container(cal5, "calico-node", "DaemonSet", "Pod routes, NetworkPolicy")
+      }
+    }
+  }
+
+  Rel(cli, vip, "kubectl", "HTTPS :6443")
+  Rel(vip, api1, "To the current leader's apiserver", "HTTPS :6443")
+  Rel(api1, etcd1, "Local member only", "gRPC :2379")
+  Rel(api2, etcd2, "Local member only", "gRPC :2379")
+  Rel(api3, etcd3, "Local member only", "gRPC :2379")
+  BiRel(etcd1, etcd2, "Raft, quorum 2 of 3", ":2380")
+  BiRel(etcd2, etcd3, "Raft", ":2380")
+
+  UpdateRelStyle(vip, api1, $offsetX="10", $offsetY="-20")
+  UpdateRelStyle(etcd1, etcd2, $offsetX="-45", $offsetY="-25")
+  UpdateRelStyle(etcd2, etcd3, $offsetX="-15", $offsetY="-25")
+
+  UpdateLayoutConfig($c4ShapeInRow="4", $c4BoundaryInRow="3")

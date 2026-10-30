@@ -1,0 +1,63 @@
+# The platform gives every namespace default-deny + DNS. The team adds ONLY the flows this app needs:
+#   clients -> api:8080, api -> db:5432. Everything else (db from other pods, api to the internet, ...) stays blocked.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress-from-clients
+spec:
+  podSelector:
+    matchLabels: { app: api }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { access: api-client }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-egress-to-db
+spec:
+  podSelector:
+    matchLabels: { app: api }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: db }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+# Default-deny also blocks the CLIENT's outgoing traffic, so the allow on the api side (ingress) is only half of
+# the flow. Pods labelled access=api-client may open connections to the api, and nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-clients-egress-to-api
+spec:
+  podSelector:
+    matchLabels: { access: api-client }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: api }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-ingress-from-api
+spec:
+  podSelector:
+    matchLabels: { app: db }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: api }
+      ports:
+        - { protocol: TCP, port: 5432 }

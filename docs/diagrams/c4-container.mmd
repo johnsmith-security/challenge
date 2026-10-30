@@ -1,0 +1,45 @@
+C4Container
+  title Container diagram: platform control plane and the cluster it manages (lab: one cluster plays both roles)
+
+  Person(pe, "Platform engineer", "Requests a team environment by committing one TeamEnvironment file")
+  Person(dev, "Team developer", "Owns the team's application manifests")
+
+  System_Boundary(git, "Git (Gitea in the lab, stand-in for the client's Git server)") {
+    ContainerDb(pcfg, "platform-config repo", "Git", "crossplane/: XRD + Composition. environments/: one TeamEnvironment per team")
+    ContainerDb(trepo, "team-blue-app repo", "Git", "deploy/: api + db Deployments, Services, NetworkPolicies")
+  }
+
+  Boundary(k8s, "Kubernetes cluster lima-ha (management and workload)", "kubeadm v1.34, 3 control planes + 2 workers") {
+
+    Container_Boundary(pcp, "Platform control plane") {
+      Container(argo, "Argo CD", "v3.5, namespace argocd", "Apps platform-api, team-environments, cluster-maintenance + one app per team. UI on NodePort 30090")
+      Container(xp, "Crossplane", "v2.4, namespace crossplane-system", "Reconciles TeamEnvironment into the composed objects")
+      Container(fn, "Composition functions", "function-go-templating, function-auto-ready", "Called by Crossplane over gRPC: render the objects from the Go template, mark readiness")
+      Container(api, "Kubernetes API", "kube-apiserver + etcd", "Serves the TeamEnvironment API (platform.kiratech.io/v1alpha1), validated by OpenAPI schema + CEL")
+    }
+
+    Container_Boundary(tenv, "Team environment team-blue (composed by Crossplane)") {
+      Container(guard, "Namespace guard rails", "Namespace, ResourceQuota, LimitRange, RoleBinding", "Size S/M/L quota, group team-blue-devs → edit")
+      Container(np, "NetworkPolicies", "default-deny-all + allow-dns", "Team repo adds only client → api:8080 and api → db:5432")
+      Container(app, "Team workload", "api + db Pods", "Deployed by the Argo CD app team-blue, limited by AppProject team-blue")
+    }
+  }
+
+  Rel(pe, pcfg, "Commits environments/<team>.yaml", "git push")
+  Rel(dev, trepo, "Pushes manifests", "git push")
+  Rel(argo, pcfg, "Pulls crossplane/ and environments/", "HTTP :3000")
+  Rel(argo, trepo, "Pulls deploy/ (app team-blue)", "HTTP :3000")
+  Rel(argo, api, "Applies XRD, Composition, TeamEnvironment, team manifests", "HTTPS")
+  Rel(xp, api, "Watches TeamEnvironment, manages composed objects", "HTTPS")
+  Rel(api, guard, "Creates")
+  Rel(api, np, "Creates")
+  Rel(api, app, "Runs")
+
+  UpdateRelStyle(pe, pcfg, $offsetX="-130", $offsetY="-60")
+  UpdateRelStyle(dev, trepo, $offsetX="10", $offsetY="-60")
+  UpdateRelStyle(argo, pcfg, $offsetX="-200", $offsetY="-70")
+  UpdateRelStyle(argo, trepo, $offsetX="30", $offsetY="-60")
+  UpdateRelStyle(argo, api, $offsetX="-120", $offsetY="10")
+  UpdateRelStyle(xp, api, $offsetX="-70", $offsetY="-10")
+
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")

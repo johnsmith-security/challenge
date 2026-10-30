@@ -1,0 +1,373 @@
+
+########## 1. The platform API exists
+
+$ [cp1] kubectl get applications.argoproj.io -n argocd
+NAME                  SYNC STATUS   HEALTH STATUS
+cluster-maintenance   Synced        Healthy
+platform-api          Synced        Healthy
+team-environments     Synced        Healthy
+
+$ [cp1] kubectl get xrd,compositions,functions
+NAME                                                                                            ESTABLISHED   OFFERED   AGE
+compositeresourcedefinition.apiextensions.crossplane.io/teamenvironments.platform.kiratech.io   True                    51s
+
+NAME                                                      XR-KIND           XR-APIVERSION                   AGE
+composition.apiextensions.crossplane.io/teamenvironment   TeamEnvironment   platform.kiratech.io/v1alpha1   51s
+
+NAME                                                INSTALLED   HEALTHY   PACKAGE                                                                AGE
+function.pkg.crossplane.io/function-auto-ready      True        True      xpkg.crossplane.io/crossplane-contrib/function-auto-ready:v0.7.3       51s
+function.pkg.crossplane.io/function-go-templating   True        True      xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.13.2   51s
+
+$ [cp1] kubectl api-resources --api-group=platform.kiratech.io
+NAME               SHORTNAMES   APIVERSION                      NAMESPACED   KIND
+teamenvironments   tenv         platform.kiratech.io/v1alpha1   false        TeamEnvironment
+
+$ [cp1] kubectl explain teamenvironment.spec --recursive | head -20
+GROUP:      platform.kiratech.io
+KIND:       TeamEnvironment
+VERSION:    v1alpha1
+
+FIELD: spec <Object>
+
+
+DESCRIPTION:
+    <empty>
+FIELDS:
+  crossplane	<Object>
+    compositionRef	<Object>
+      name	<string> -required-
+    compositionRevisionRef	<Object>
+      name	<string> -required-
+    compositionRevisionSelector	<Object>
+      matchLabels	<map[string]string> -required-
+    compositionSelector	<Object>
+      matchLabels	<map[string]string> -required-
+    compositionUpdatePolicy	<string>
+
+########## 2. Invalid requests are rejected by the API server (nothing is created)
+--- unknown size (XL)
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: bad }
+spec: { teamName: bad, size: XL, repoURL: "http://git.example/bad.git" }
+EOF
+The TeamEnvironment "bad" is invalid: 
+* spec.size: Unsupported value: "XL": supported values: "S", "M", "L"
+* <nil>: Invalid value: null: some validation rules were not checked because the object was invalid; correct the existing errors to complete validation
+-> rejected, as expected
+--- missing teamName
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: nameless }
+spec: { size: S, repoURL: "http://git.example/x.git" }
+EOF
+The TeamEnvironment "nameless" is invalid: 
+* spec.teamName: Required value
+* <nil>: Invalid value: null: some validation rules were not checked because the object was invalid; correct the existing errors to complete validation
+-> rejected, as expected
+--- missing size
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: nosize }
+spec: { teamName: nosize, repoURL: "http://git.example/x.git" }
+EOF
+The TeamEnvironment "nosize" is invalid: 
+* spec.size: Required value
+* <nil>: Invalid value: null: some validation rules were not checked because the object was invalid; correct the existing errors to complete validation
+-> rejected, as expected
+--- invalid team name (uppercase, underscore)
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: bad }
+spec: { teamName: Bad_Name, size: S, repoURL: "http://git.example/x.git" }
+EOF
+The TeamEnvironment "bad" is invalid: 
+* spec.teamName: Invalid value: "Bad_Name": spec.teamName in body should match '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+* <nil>: Invalid value: "object": metadata.name must equal spec.teamName (one environment per team)
+-> rejected, as expected
+--- repoURL is not a URL
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: badurl }
+spec: { teamName: badurl, size: S, repoURL: "not-a-url" }
+EOF
+The TeamEnvironment "badurl" is invalid: spec.repoURL: Invalid value: "not-a-url": spec.repoURL in body should match '^https?://[^\s/]+(/[^\s]*)?$'
+-> rejected, as expected
+--- metadata.name differs from teamName
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata: { name: one }
+spec: { teamName: other, size: S, repoURL: "http://git.example/x.git" }
+EOF
+The TeamEnvironment "one" is invalid: <nil>: Invalid value: "object": metadata.name must equal spec.teamName (one environment per team)
+-> rejected, as expected
+
+$ [cp1] kubectl get teamenvironments
+No resources found
+
+########## 3. Create an environment by committing ONE file to Git (GitOps path): environments/blue.yaml
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata:
+  name: blue
+spec:
+  teamName: blue
+  size: S
+  repoURL: http://gitea-http.gitea.svc.cluster.local:3000/platform/team-blue-app.git
+806bb45 Add team environment: blue (size S)
+be1eb17 Initial commit
+
+$ [cp1] kubectl get teamenvironments
+NAME   TEAM   SIZE   SYNCED   READY   COMPOSITION       AGE
+blue   blue   S      True     True    teamenvironment   4s
+
+$ [cp1] kubectl get namespace team-blue --show-labels
+NAME        STATUS   AGE   LABELS
+team-blue   Active   2s    crossplane.io/composite=blue,kubernetes.io/metadata.name=team-blue,platform.kiratech.io/size=S,platform.kiratech.io/team=blue
+
+$ [cp1] kubectl -n team-blue get resourcequota,limitrange,rolebinding,networkpolicy
+NAME                       REQUEST   LIMIT   AGE
+resourcequota/team-quota                     2s
+
+NAME                     CREATED AT
+limitrange/team-limits   2026-10-29T10:08:58Z
+
+NAME                                              ROLE               AGE
+rolebinding.rbac.authorization.k8s.io/team-edit   ClusterRole/edit   2s
+
+NAME                                                        POD-SELECTOR        AGE
+networkpolicy.networking.k8s.io/allow-dns                   <none>              2s
+networkpolicy.networking.k8s.io/api-clients-egress-to-api   access=api-client   1s
+networkpolicy.networking.k8s.io/api-egress-to-db            app=api             1s
+networkpolicy.networking.k8s.io/api-ingress-from-clients    app=api             1s
+networkpolicy.networking.k8s.io/db-ingress-from-api         app=db              1s
+networkpolicy.networking.k8s.io/default-deny-all            <none>              2s
+
+$ [cp1] kubectl -n team-blue describe resourcequota team-quota
+Name:       team-quota
+Namespace:  team-blue
+Resource    Used  Hard
+--------    ----  ----
+
+$ [cp1] kubectl -n argocd get appproject,application | grep -E "NAME|team-blue"
+NAME                               AGE
+appproject.argoproj.io/team-blue   2s
+NAME                                          SYNC STATUS   HEALTH STATUS
+application.argoproj.io/team-blue             Synced        Progressing
+
+$ [cp1] kubectl -n argocd get application team-blue
+NAME        SYNC STATUS   HEALTH STATUS
+team-blue   Synced        Healthy
+
+$ [cp1] kubectl -n team-blue get deploy,pods,svc,networkpolicy
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/api   1/1     1            1           18s
+deployment.apps/db    1/1     1            1           18s
+
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/api-57f67b4c8c-28ms7   1/1     Running   0          18s
+pod/db-85cdcc7f59-jzq48    1/1     Running   0          18s
+
+NAME          TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+service/api   ClusterIP   10.97.159.96   <none>        8080/TCP   18s
+service/db    ClusterIP   10.105.31.36   <none>        5432/TCP   18s
+
+NAME                                                        POD-SELECTOR        AGE
+networkpolicy.networking.k8s.io/allow-dns                   <none>              19s
+networkpolicy.networking.k8s.io/api-clients-egress-to-api   access=api-client   18s
+networkpolicy.networking.k8s.io/api-egress-to-db            app=api             18s
+networkpolicy.networking.k8s.io/api-ingress-from-clients    app=api             18s
+networkpolicy.networking.k8s.io/db-ingress-from-api         app=db              18s
+networkpolicy.networking.k8s.io/default-deny-all            <none>              19s
+
+########## 4. Create a second environment with kubectl (size M), then resize it
+
+$ [cp1] kubectl apply -f - <<'EOF'
+apiVersion: platform.kiratech.io/v1alpha1
+kind: TeamEnvironment
+metadata:
+  name: green
+spec:
+  teamName: green
+  size: M
+  repoURL: http://gitea-http.gitea.svc.cluster.local:3000/platform/team-blue-app.git
+EOF
+teamenvironment.platform.kiratech.io/green created
+
+$ [cp1] kubectl get teamenvironments
+NAME    TEAM    SIZE   SYNCED   READY   COMPOSITION       AGE
+blue    blue    S      True     True    teamenvironment   25s
+green   green   M      True     True    teamenvironment   4s
+--- quota of S (blue) vs M (green)
+
+$ [cp1] kubectl get resourcequota -A -o 'custom-columns=NS:.metadata.namespace,REQ_CPU:.spec.hard.requests\.cpu,REQ_MEM:.spec.hard.requests\.memory,LIM_CPU:.spec.hard.limits\.cpu,LIM_MEM:.spec.hard.limits\.memory,PODS:.spec.hard.pods' | grep -E 'NS|team-'
+NS           REQ_CPU   REQ_MEM   LIM_CPU   LIM_MEM   PODS
+team-blue    500m      512Mi     1         1Gi       10
+team-green   1         1Gi       2         2Gi       20
+--- resize green M -> L
+
+$ [cp1] kubectl patch teamenvironment green --type merge -p '{"spec":{"size":"L"}}'
+teamenvironment.platform.kiratech.io/green patched
+
+$ [cp1] kubectl -n team-green get resourcequota team-quota -o jsonpath='{.spec.hard}{"\n"}'
+{"limits.cpu":"4","limits.memory":"4Gi","pods":"40","requests.cpu":"2","requests.memory":"2Gi"}
+--- teamName is immutable (changing it would delete the namespace)
+
+$ [cp1] kubectl patch teamenvironment green --type merge -p '{"spec":{"teamName":"yellow"}}'
+The TeamEnvironment "green" is invalid: 
+* <nil>: Invalid value: "object": metadata.name must equal spec.teamName (one environment per team)
+* spec.teamName: Invalid value: "string": teamName is immutable (changing it would delete the namespace)
+-> rejected, as expected
+
+$ [cp1] kubectl get teamenvironments
+NAME    TEAM    SIZE   SYNCED   READY   COMPOSITION       AGE
+blue    blue    S      True     True    teamenvironment   25s
+green   green   L      True     True    teamenvironment   4s
+
+########## 5. RBAC: the team group can work in its own namespace only, and cannot touch platform-owned objects
+
+$ [cp1] kubectl get rolebinding team-edit -n team-blue -o wide
+NAME        ROLE               AGE   USERS   GROUPS           SERVICEACCOUNTS
+team-edit   ClusterRole/edit   23s           team-blue-devs   
+--- can group team-blue-devs create deployments in team-blue?
+
+$ [cp1] kubectl auth can-i create deployments -n team-blue --as=alice --as-group=team-blue-devs
+yes
+-> allowed, as expected
+--- ...in team-green?
+
+$ [cp1] kubectl auth can-i create deployments -n team-green --as=alice --as-group=team-blue-devs
+no
+-> BLOCKED, as expected
+--- ...change its own ResourceQuota / NetworkPolicy defaults? (quota: must be no)
+
+$ [cp1] kubectl auth can-i update resourcequotas -n team-blue --as=alice --as-group=team-blue-devs
+no
+-> BLOCKED, as expected
+--- ...read nodes (cluster scope)?
+
+$ [cp1] kubectl auth can-i list nodes --as=alice --as-group=team-blue-devs
+Warning: resource 'nodes' is not namespace scoped
+
+no
+-> BLOCKED, as expected
+
+########## 6. Workload under default-deny: only the flows the app needs are open
+
+$ [cp1] kubectl -n team-blue get networkpolicy
+NAME                        POD-SELECTOR        AGE
+allow-dns                   <none>              24s
+api-clients-egress-to-api   access=api-client   23s
+api-egress-to-db            app=api             23s
+api-ingress-from-clients    app=api             23s
+db-ingress-from-api         app=db              23s
+default-deny-all            <none>              24s
+
+$ [cp1] kubectl -n team-blue delete pod intruder client --ignore-not-found --wait=true; kubectl -n default delete pod xns --ignore-not-found --wait=true
+
+$ [cp1] kubectl -n team-blue run intruder --image=busybox:1.28 --restart=Never -- sleep 3600 && kubectl -n team-blue run client --image=busybox:1.28 --restart=Never --labels=access=api-client -- sleep 3600 && kubectl -n default run xns --image=busybox:1.28 --restart=Never -- sleep 3600 && kubectl -n team-blue wait --for=condition=Ready pod/intruder pod/client --timeout=180s && kubectl -n default wait --for=condition=Ready pod/xns --timeout=180s
+pod/intruder created
+pod/client created
+pod/xns created
+pod/intruder condition met
+pod/client condition met
+pod/xns condition met
+--- allowed: DNS works (platform allow-dns policy)
+
+$ [cp1] kubectl -n team-blue exec deploy/api -- nslookup db
+Server:    10.96.0.10
+Address 1: 10.96.0.10 kube-dns.kube-system.svc.cluster.local
+
+Name:      db
+Address 1: 10.105.31.36 db.team-blue.svc.cluster.local
+-> allowed, as expected
+--- allowed: api -> db:5432 (team policy api-egress-to-db + db-ingress-from-api)
+
+$ [cp1] kubectl -n team-blue exec deploy/api -- nc -zv -w 3 db 5432
+db (10.105.31.36:5432) open
+-> allowed, as expected
+--- allowed: labelled client -> api:8080 (team policy api-ingress-from-clients)
+
+$ [cp1] kubectl -n team-blue exec client -- wget -qO- -T 3 http://api:8080
+api-ok
+-> allowed, as expected
+--- blocked: unlabelled pod in the same namespace -> api:8080
+
+$ [cp1] kubectl -n team-blue exec intruder -- wget -qO- -T 3 http://api:8080
+wget: download timed out
+command terminated with exit code 1
+-> BLOCKED, as expected
+--- blocked: unlabelled pod -> db:5432 (only api may talk to the database)
+
+$ [cp1] kubectl -n team-blue exec intruder -- nc -zv -w 3 db 5432
+nc: db (10.105.31.36:5432): Connection timed out
+command terminated with exit code 1
+-> BLOCKED, as expected
+--- blocked: pod from ANOTHER namespace -> api:8080
+
+$ [cp1] kubectl -n default exec xns -- wget -qO- -T 3 http://api.team-blue.svc.cluster.local:8080
+wget: download timed out
+command terminated with exit code 1
+-> BLOCKED, as expected
+--- blocked: api -> the internet (no egress rule)
+
+$ [cp1] kubectl -n team-blue exec deploy/api -- wget -qO- -T 3 http://1.1.1.1
+wget: download timed out
+command terminated with exit code 1
+-> BLOCKED, as expected
+
+$ [cp1] kubectl -n team-blue delete pod intruder client --wait=false; kubectl -n default delete pod xns --wait=false
+pod "intruder" deleted from team-blue namespace
+pod "client" deleted from team-blue namespace
+pod "xns" deleted from default namespace
+
+########## 7. Deleting the resource removes the environment: blue via Git (git rm), green via kubectl delete
+204178b Remove team environment: blue
+806bb45 Add team environment: blue (size S)
+be1eb17 Initial commit
+
+$ [cp1] kubectl delete teamenvironment green --wait=false
+teamenvironment.platform.kiratech.io "green" deleted
+
+$ [cp1] kubectl get teamenvironments
+No resources found
+
+$ [cp1] kubectl get namespace
+NAME                   STATUS   AGE
+argocd                 Active   4m13s
+calico-apiserver       Active   94m
+calico-system          Active   94m
+crossplane-system      Active   2m58s
+default                Active   95m
+gitea                  Active   4m28s
+kube-node-lease        Active   95m
+kube-public            Active   95m
+kube-system            Active   95m
+platform-maintenance   Active   2m30s
+tigera-operator        Active   94m
+--- nothing left behind:
+
+$ [cp1] kubectl -n argocd get applications,appprojects; kubectl get clusterrolebindings,rolebindings -A 2>/dev/null | grep -E "team-(blue|green)" || echo "no team-blue/team-green RBAC left"
+NAME                                          SYNC STATUS   HEALTH STATUS
+application.argoproj.io/cluster-maintenance   Synced        Healthy
+application.argoproj.io/platform-api          Synced        Healthy
+application.argoproj.io/team-environments     Synced        Healthy
+
+NAME                              AGE
+appproject.argoproj.io/default    3m35s
+appproject.argoproj.io/platform   2m33s
+no team-blue/team-green RBAC left
+
+RESULT: all Part 3 checks behaved as expected
