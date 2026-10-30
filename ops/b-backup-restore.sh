@@ -11,7 +11,8 @@ log "0. Tooling: etcdutl/etcdctl matching the running etcd version on every cont
 ETCD_VER=$(vmq cp1 "kubectl -n kube-system exec etcd-cp1 -- etcd --version | awk '/etcd Version/{print \$3}'")
 echo "running etcd version: $ETCD_VER"
 for n in "${CPS[@]}"; do
-  vm "$n" "curl -fsSL https://github.com/etcd-io/etcd/releases/download/v$ETCD_VER/etcd-v$ETCD_VER-linux-arm64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin etcd-v$ETCD_VER-linux-arm64/etcdctl etcd-v$ETCD_VER-linux-arm64/etcdutl && etcdutl version | head -1"
+  # retries: right after a reboot (e.g. a-failover.sh) the node's DNS can need a few seconds
+  vm "$n" "curl -fsSL --retry 10 --retry-delay 3 --retry-all-errors https://github.com/etcd-io/etcd/releases/download/v$ETCD_VER/etcd-v$ETCD_VER-linux-arm64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin etcd-v$ETCD_VER-linux-arm64/etcdctl etcd-v$ETCD_VER-linux-arm64/etcdutl && etcdutl version | head -1"
 done
 
 log "1. Create a namespace with some resources"
