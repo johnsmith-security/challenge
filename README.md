@@ -38,9 +38,8 @@ for v in w1 w2;       do limactl create --name=$v --cpus=2 --memory=3   --disk=3
 for v in cp1 cp2 cp3 w1 w2; do limactl start $v; done
 
 # 3. cluster (~5 min) and kubectl from the Mac
-./bootstrap-cluster.sh
-limactl shell cp1 -- sudo cat /etc/kubernetes/admin.conf > ~/.kube/lima-ha.conf && chmod 600 ~/.kube/lima-ha.conf
-export KUBECONFIG=~/.kube/lima-ha.conf
+./bootstrap-cluster.sh                     # also writes ~/.kube/lima-ha.conf on the Mac
+export KUBECONFIG=~/.kube/lima-ha.conf     # needed in every new terminal
 kubectl get nodes
 
 # 4. Part 2 (in this order)
@@ -84,6 +83,7 @@ The template installs from the `K8S_MINOR="v1.34"` apt repository; change it to 
 
 `./bootstrap-cluster.sh`:
 
+0. checks that every VM was created from `lima/k8s-node.yaml` (has `lima0` on 192.168.105.0/24 and `kubeadm`), and stops with a clear error otherwise;
 1. sets kubelet `--node-ip` to the `lima0` address on every VM (all Lima VMs share the same `eth0` address);
 2. on `cp1`: writes the kube-vip static pod (using `super-admin.conf`, required during `kubeadm init` on 1.29+),
    runs `kubeadm init --control-plane-endpoint 192.168.105.200:6443 --upload-certs`, and installs Calico with the pod
@@ -91,7 +91,8 @@ The template installs from the `K8S_MINOR="v1.34"` apt repository; change it to 
    pinned to `lima0`;
 3. joins `cp2`, then `cp3`, as control planes (waiting for `Ready`) and adds kube-vip to each;
 4. joins `w1` and `w2`;
-5. switches kube-vip on `cp1` back to `admin.conf` and sets up `~/.kube/config` on every control plane.
+5. switches kube-vip on `cp1` back to `admin.conf` and sets up `~/.kube/config` on every control plane;
+6. copies `admin.conf` to `~/.kube/lima-ha.conf` on the Mac (written to a temp file first, so a failed copy never leaves an empty file).
 
 Health check:
 
@@ -288,3 +289,28 @@ group name.
 | `nslookup` NXDOMAIN in busybox | use `busybox:1.28` or the FQDN |
 | Join token / certificate key expired | `kubeadm token create --print-join-command`, `kubeadm init phase upload-certs --upload-certs` |
 | Failed join | `sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d`; for a control plane also `kubectl delete node` and remove its etcd member |
+
+
+
+Notes :
+
+cd ~/Education/challenge
+limactl delete -f cp1 cp2 cp3 w1 w2
+for v in cp1 cp2 cp3; do limactl create --name=$v --cpus=2 --memory=2.5 --disk=20 --tty=false lima/k8s-node.yaml || break; done
+for v in w1 w2;       do limactl create --name=$v --cpus=2 --memory=3   --disk=30 --tty=false lima/k8s-node.yaml || break; done
+limactl list            # check: 2 CPUs, 2.5/3 GiB, 20/30 GiB
+for v in cp1 cp2 cp3 w1 w2; do limactl start $v; done
+limactl shell cp1 -- ip -br addr show lima0   # must show 192.168.105.x
+./bootstrap-cluster.sh 2>&1 | tee /tmp/bootstrap-cluster.log
+
+
+
+cd ~/Education/challenge
+export KUBECONFIG=~/.kube/lima-ha.conf
+rm -rf platform/.work          # the local Git seed from the old build, so it starts clean
+platform/bootstrap-platform.sh 2>&1 | tee platform/bootstrap-platform.log
+
+
+
+- kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d 
+- kubectl -n gitea  get secret gitea-admin                 -o jsonpath='{.data.password}' | base64 -d 

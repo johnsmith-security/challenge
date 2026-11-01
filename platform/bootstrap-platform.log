@@ -52,6 +52,7 @@ partitioned roll out complete: 1 new pods have been updated...
 $ [cp1] kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
 Waiting for deployment "argocd-server" rollout to finish: 1 old replicas are pending termination...
 Waiting for deployment "argocd-server" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "argocd-server" rollout to finish: 1 old replicas are pending termination...
 deployment "argocd-server" successfully rolled out
 
 $ [cp1] kubectl -n argocd wait --for=condition=Available deployment --all --timeout=300s
@@ -69,7 +70,7 @@ $ [cp1] helm repo add crossplane-stable https://charts.crossplane.io/stable >/de
 Chart Version: 2.4.3
 Chart Application Version: 2.4.3
 
-Kube Version: v1.34.13
+Kube Version: v1.35.10
 
 ########## 6. Hand over to GitOps: two root Argo CD Applications pointing at the platform-config repository
 

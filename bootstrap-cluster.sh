@@ -3,6 +3,7 @@
 # (cp1 cp2 cp3 w1 w2, created from lima/k8s-node.yaml with `lima: shared`).
 # Run from the host: ./bootstrap-cluster.sh
 set -euo pipefail
+cd "$(dirname "$0")"
 
 VIP=192.168.105.200
 KVVERSION=v0.8.9
@@ -29,6 +30,21 @@ ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:$KVVERSION vip /kube-vip manif
 sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/$2#' /etc/kubernetes/manifests/kube-vip.yaml
 EOF
 }
+
+log "Preflight: VMs created from lima/k8s-node.yaml (lima0 on 192.168.105.0/24, kubeadm installed)"
+# A VM started without the template (e.g. `limactl start cp1` before `limactl create`) gets Lima's
+# default config: no lima0, no kubeadm. Catch that here instead of failing halfway through.
+for vm in $CPS $WORKERS; do
+  if ! limactl list -q 2>/dev/null | grep -qx "$vm"; then
+    echo "ERROR: VM $vm does not exist. Create it from lima/k8s-node.yaml (README, Quick start step 2)." >&2; exit 1
+  fi
+  ip=$(limactl shell "$vm" -- ip -4 -o addr show lima0 2>/dev/null </dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+  if [[ "$ip" != 192.168.105.* ]] || ! limactl shell "$vm" -- which kubeadm </dev/null >/dev/null 2>&1; then
+    echo "ERROR: $vm has no lima0 on 192.168.105.0/24 or no kubeadm: it was not created from lima/k8s-node.yaml." >&2
+    echo "       Recreate it: limactl delete -f $vm, then the limactl create line from the README." >&2; exit 1
+  fi
+  echo "$vm: $ip"
+done
 
 log "Setting kubelet --node-ip (lima0) on all VMs"
 for vm in $CPS $WORKERS; do
@@ -110,10 +126,18 @@ for vm in $CPS; do
   limactl shell "$vm" -- bash -c 'mkdir -p ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config && chmod 600 ~/.kube/config' 2> >(grep -v 'LIMA_CIDATA' >&2)
 done
 
+log "kubectl on the Mac: ~/.kube/lima-ha.conf"
+# Written to a temp file first, so a failed copy never leaves an empty kubeconfig behind
+mkdir -p ~/.kube
+tmp=$(mktemp ~/.kube/lima-ha.conf.XXXXXX)
+limactl shell cp1 -- sudo cat /etc/kubernetes/admin.conf > "$tmp" 2> >(grep -v 'LIMA_CIDATA' >&2)
+[[ -s "$tmp" ]] || { rm -f "$tmp"; echo "ERROR: could not copy admin.conf from cp1" >&2; exit 1; }
+chmod 600 "$tmp" && mv "$tmp" ~/.kube/lima-ha.conf
+export KUBECONFIG=~/.kube/lima-ha.conf
+
 log "Result"
-rsh_out cp1 <<'EOF'
-export KUBECONFIG=/etc/kubernetes/admin.conf
 kubectl wait --for=condition=Ready nodes --all --timeout=600s
 kubectl get nodes -o wide
 kubectl get pods -A
-EOF
+echo
+echo "Done. In every new terminal: export KUBECONFIG=~/.kube/lima-ha.conf"
